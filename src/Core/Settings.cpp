@@ -7238,6 +7238,30 @@ Specifies the name of a TimeSeries table used by the 'promql' dialect.
 Sets the evaluation time to be used with promql dialect. 'auto' means the current time.
 )", EXPERIMENTAL, evaluation_time) \
     \
+    DECLARE_WITH_ALIAS(String, ai_model_name, "", R"(
+Name of the model to use for AI queries.
+)", EXPERIMENTAL, ai_model_name) \
+    \
+    DECLARE_WITH_ALIAS(String, ai_api_key, "", R"(
+API key to use for AI queries.
+)", EXPERIMENTAL, ai_api_key) \
+    \
+    DECLARE_WITH_ALIAS(String, ai_base_url, "", R"(
+Base URL for AI service.
+)", EXPERIMENTAL, ai_base_url) \
+    \
+    DECLARE_WITH_ALIAS(UInt64, ai_max_concurrent_requests, 16, R"(
+Maximal number of concurrent requests to AI service.
+)", EXPERIMENTAL, ai_max_concurrent_requests) \
+    \
+    DECLARE_WITH_ALIAS(UInt64, ai_request_timeout, 60, R"(
+Timeout for requests to AI service.
+)", EXPERIMENTAL, ai_request_timeout) \
+    \
+    DECLARE_WITH_ALIAS(UInt64, ai_max_batch_size, 50, R"(
+Max batch size for requests to AI service.
+)", EXPERIMENTAL, ai_max_batch_size) \
+    \
     /* ####################################################### */ \
     /* ############ END OF EXPERIMENTAL FEATURES ############# */ \
     /* ####################################################### */ \

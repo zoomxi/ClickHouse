@@ -2,6 +2,9 @@
 
 #include <boost/algorithm/string/split.hpp>
 #include <Common/StringUtils.h>
+#include <Common/ExecutableProcessPool.h>
+#include <Common/SharedMemoryCommand.h>
+#include <Common/filesystemHelpers.h>
 #include <Core/Settings.h>
 #include <Interpreters/Context.h>
 
@@ -167,8 +170,12 @@ ExternalLoader::LoadableMutablePtr ExternalUserDefinedExecutableFunctionsLoader:
         command_value = std::move(command_arguments[0]);
         command_arguments.erase(command_arguments.begin());
     }
-
-    String format = config.getString(key_in_config + ".format");
+    
+    // Read format early (needed for parameter passing)
+    String format = config.getString(key_in_config + ".format", "TabSeparatedRaw");  // Default to TabSeparatedRaw
+    
+    // Check if need_ai_model flag is set (default: false for backward compatibility)
+    bool need_ai_model = config.getBool(key_in_config + ".need_ai_model", false);
     DataTypePtr result_type = DataTypeFactory::instance().get(config.getString(key_in_config + ".return_type"));
     String result_name = "result";
     if (config.has(key_in_config + ".return_name"))
@@ -176,6 +183,26 @@ ExternalLoader::LoadableMutablePtr ExternalUserDefinedExecutableFunctionsLoader:
 
     bool is_deterministic = config.getBool(key_in_config + ".deterministic", false);
 
+    // Transport mode configuration (pipe or shared_memory)
+    String transport = config.getString(key_in_config + ".transport", "pipe");
+    if (transport != "pipe" && transport != "shared_memory")
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "Invalid transport type '{}' for user defined function '{}'. Must be 'pipe' or 'shared_memory'",
+            transport, name);
+
+    // Validate: shared_memory transport requires executable_pool type
+    if (transport == "shared_memory" && !is_executable_pool)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "User defined function '{}' with transport='shared_memory' must use type='executable_pool'",
+            name);
+
+    // Validate: pipe transport requires format specification
+    if (transport == "pipe" && format.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "User defined function '{}' with transport='pipe' must specify 'format' parameter",
+            name);
+
+    // Pipe mode specific configuration (read first for potential reuse in shared_memory mode)
     bool send_chunk_header = config.getBool(key_in_config + ".send_chunk_header", false);
     size_t command_termination_timeout_seconds = config.getUInt64(key_in_config + ".command_termination_timeout", 10);
     size_t command_read_timeout_milliseconds = config.getUInt64(key_in_config + ".command_read_timeout", 10000);
@@ -183,6 +210,41 @@ ExternalLoader::LoadableMutablePtr ExternalUserDefinedExecutableFunctionsLoader:
     ExternalCommandStderrReaction stderr_reaction
         = parseExternalCommandStderrReaction(config.getString(key_in_config + ".stderr_reaction", "log_last"));
     bool check_exit_code = config.getBool(key_in_config + ".check_exit_code", true);
+
+    // Shared memory specific configuration (initialized with defaults, may be overridden below)
+    size_t shared_memory_size = 16 * 1024 * 1024;  // 16 MB default
+    size_t connection_timeout_ms = 10000;  // 10 seconds default
+    size_t operation_timeout_ms = 60000;  // 60 seconds default
+    size_t health_check_interval_seconds = 60;  // 60 seconds default
+    size_t ping_timeout_ms = 5000;  // 5 seconds default
+
+    if (transport == "shared_memory")
+    {
+        // Read shared_memory_size (renamed from shm_size)
+        shared_memory_size = config.getUInt64(key_in_config + ".shared_memory_size", 16 * 1024 * 1024);
+        
+        // Validate shared_memory_size range
+        if (shared_memory_size < 1024 * 1024) // Minimum 1 MB
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "User defined function '{}': shared_memory_size must be at least 1 MB, got {}",
+                name, shared_memory_size);
+        
+        if (shared_memory_size > 1024 * 1024 * 1024) // Maximum 1 GB
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "User defined function '{}': shared_memory_size must not exceed 1 GB, got {}",
+                name, shared_memory_size);
+        
+        // Connection timeout (subprocess startup) - dedicated parameter
+        connection_timeout_ms = config.getUInt64(key_in_config + ".connection_timeout_ms", 10000);
+        
+        // Operation timeout - reuse command_read/write_timeout if not explicitly specified
+        // This provides backward compatibility and reduces configuration burden
+        operation_timeout_ms = std::max(command_read_timeout_milliseconds, command_write_timeout_milliseconds);
+        
+        // Health check configuration - dedicated parameters
+        health_check_interval_seconds = config.getUInt64(key_in_config + ".health_check_interval_seconds", 60);
+        ping_timeout_ms = config.getUInt64(key_in_config + ".ping_timeout_ms", 5000);
+    }
 
     size_t pool_size = 0;
     size_t max_command_execution_time = 0;
@@ -236,15 +298,91 @@ ExternalLoader::LoadableMutablePtr ExternalUserDefinedExecutableFunctionsLoader:
     UserDefinedExecutableFunctionConfiguration function_configuration
     {
         .name = name,
-        .command = std::move(command_value),
-        .command_arguments = std::move(command_arguments),
+        .command = command_value,
+        .command_arguments = command_arguments,
         .arguments = std::move(arguments),
         .parameters = std::move(parameters),
         .result_type = std::move(result_type),
         .result_name = std::move(result_name),
-        .is_deterministic = is_deterministic
+        .is_deterministic = is_deterministic,
+        .transport = transport,
+        .shared_memory_size = shared_memory_size,
+        .connection_timeout_ms = connection_timeout_ms,
+        .operation_timeout_ms = operation_timeout_ms,
+        .health_check_interval_seconds = health_check_interval_seconds,
+        .ping_timeout_ms = ping_timeout_ms,
+        .need_ai_model = need_ai_model,
+        .data_format = format
     };
 
+    // Create UserDefinedExecutableFunction based on transport mode
+    if (transport == "shared_memory")
+    {
+        // Shared memory mode: use ExecutableProcessPool
+        
+        // Handle execute_direct: convert relative path to absolute path
+        String command_path = command_value;
+        if (execute_direct)
+        {
+            auto user_scripts_path = getContext()->getUserScriptsPath();
+            command_path = user_scripts_path + '/' + command_value;
+            
+            if (!fileOrSymlinkPathStartsWith(command_path, user_scripts_path))
+                throw Exception(
+                    ErrorCodes::UNSUPPORTED_METHOD,
+                    "Executable file {} must be inside user scripts folder {}",
+                    command_value,
+                    user_scripts_path);
+            
+            if (!FS::exists(command_path))
+                throw Exception(
+                    ErrorCodes::UNSUPPORTED_METHOD,
+                    "Executable file {} does not exist inside user scripts folder {}",
+                    command_value,
+                    user_scripts_path);
+            
+            if (!FS::canExecute(command_path))
+                throw Exception(
+                    ErrorCodes::UNSUPPORTED_METHOD,
+                    "Executable file {} is not executable inside user scripts folder {}",
+                    command_value,
+                    user_scripts_path);
+        }
+        
+        // Configure SharedMemoryCommand
+        SharedMemoryCommand::Config uds_config;
+        uds_config.command = command_path;
+        
+        // For need_ai_model=true, arguments will be added dynamically at execution time
+        // For need_ai_model=false, use the static arguments from config
+        if (!need_ai_model)
+        {
+            uds_config.arguments = command_arguments;
+        }
+        // else: arguments will be provided when borrowing process from pool
+        
+        uds_config.connection_timeout_ms = connection_timeout_ms;
+        uds_config.operation_timeout_ms = operation_timeout_ms;
+        
+        // Configure ExecutableProcessPool
+        ExecutableProcessPool::Config pool_config;
+        pool_config.pool_size = pool_size;
+        pool_config.uds_config = std::move(uds_config);
+        pool_config.initial_shared_memory_size = shared_memory_size;
+        pool_config.max_shared_memory_size = std::max(shared_memory_size, size_t(1024 * 1024 * 1024));  // At least 1GB max
+        pool_config.borrow_timeout_ms = operation_timeout_ms;  // Use operation timeout for borrow
+        pool_config.enable_health_check = (health_check_interval_seconds > 0);
+        pool_config.health_check_interval_ms = health_check_interval_seconds * 1000;  // Convert to ms
+        pool_config.enable_argument_matching = need_ai_model;  // Enable argument matching for dynamic AI parameters
+        
+        // Create process pool
+        auto process_pool = std::make_shared<ExecutableProcessPool>(std::move(pool_config));
+        
+        // Create function with process pool
+        return std::make_shared<UserDefinedExecutableFunction>(function_configuration, std::move(process_pool), lifetime);
+    }
+
+    // Pipe mode: use ShellCommandSourceCoordinator (default)
     ShellCommandSourceCoordinator::Configuration shell_command_coordinator_configration
     {
         .format = std::move(format),

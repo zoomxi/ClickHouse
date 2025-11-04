@@ -5,6 +5,7 @@
 #include <DataTypes/IDataType.h>
 #include <Processors/Sources/ShellCommandSource.h>
 #include <Interpreters/IExternalLoadable.h>
+#include <Common/ExecutableProcessPool.h>
 
 
 namespace DB
@@ -32,15 +33,32 @@ struct UserDefinedExecutableFunctionConfiguration
     DataTypePtr result_type;
     String result_name;
     bool is_deterministic;
+    
+    // AI Function configuration
+    String transport;  // "pipe" or "shared_memory"
+    size_t shared_memory_size;       // Shared memory size in bytes
+    size_t connection_timeout_ms;    // Subprocess startup connection timeout
+    size_t operation_timeout_ms;     // UDS control message send/receive timeout
+    size_t health_check_interval_seconds;  // Health check interval
+    size_t ping_timeout_ms;          // PING/PONG timeout
+    bool need_ai_model;              // Whether to load AI parameters at execution time
+    String data_format;              // Data format for AI model parameters
 };
 
 class UserDefinedExecutableFunction final : public IExternalLoadable
 {
 public:
 
+    // Constructor for pipe mode
     UserDefinedExecutableFunction(
         const UserDefinedExecutableFunctionConfiguration & configuration_,
         std::shared_ptr<ShellCommandSourceCoordinator> coordinator_,
+        const ExternalLoadableLifetime & lifetime_);
+
+    // Constructor for shared_memory mode
+    UserDefinedExecutableFunction(
+        const UserDefinedExecutableFunctionConfiguration & configuration_,
+        std::shared_ptr<ExecutableProcessPool> process_pool_,
         const ExternalLoadableLifetime & lifetime_);
 
     const ExternalLoadableLifetime & getLifetime() const override
@@ -65,6 +83,9 @@ public:
 
     std::shared_ptr<IExternalLoadable> clone() const override
     {
+        if (process_pool)
+            return std::make_shared<UserDefinedExecutableFunction>(configuration, process_pool, lifetime);
+
         return std::make_shared<UserDefinedExecutableFunction>(configuration, coordinator, lifetime);
     }
 
@@ -76,6 +97,11 @@ public:
     std::shared_ptr<ShellCommandSourceCoordinator> getCoordinator() const
     {
         return coordinator;
+    }
+
+    std::shared_ptr<ExecutableProcessPool> getProcessPool() const
+    {
+        return process_pool;
     }
 
     std::shared_ptr<UserDefinedExecutableFunction> shared_from_this()
@@ -90,7 +116,8 @@ public:
 
 private:
     UserDefinedExecutableFunctionConfiguration configuration;
-    std::shared_ptr<ShellCommandSourceCoordinator> coordinator;
+    std::shared_ptr<ShellCommandSourceCoordinator> coordinator;  // For pipe mode
+    std::shared_ptr<ExecutableProcessPool> process_pool;         // For shared_memory mode
     ExternalLoadableLifetime lifetime;
 };
 

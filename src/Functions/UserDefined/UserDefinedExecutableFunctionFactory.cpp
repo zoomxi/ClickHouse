@@ -12,7 +12,6 @@
 
 #include <Processors/Sources/ShellCommandSource.h>
 #include <Processors/Sources/SourceFromSingleChunk.h>
-#include <Formats/formatBlock.h>
 
 #include <Functions/FunctionHelpers.h>
 #include <Functions/IFunctionAdaptors.h>
@@ -25,22 +24,26 @@
 
 namespace DB
 {
-
 namespace ErrorCodes
 {
-    extern const int UNSUPPORTED_METHOD;
-    extern const int BAD_ARGUMENTS;
-    extern const int UDF_EXECUTION_FAILED;
+extern const int UNSUPPORTED_METHOD;
+extern const int BAD_ARGUMENTS;
+extern const int UDF_EXECUTION_FAILED;
 }
 
 namespace Setting
 {
-    extern const SettingsBool log_queries;
+extern const SettingsBool log_queries;
+extern const SettingsString ai_model_name;
+extern const SettingsString ai_api_key;
+extern const SettingsString ai_base_url;
+extern const SettingsUInt64 ai_max_concurrent_requests;
+extern const SettingsUInt64 ai_request_timeout;
+extern const SettingsUInt64 ai_max_batch_size;
 }
 
 namespace
 {
-
 class UserDefinedFunction final : public IFunction
 {
 public:
@@ -54,7 +57,8 @@ public:
         const auto & configuration = executable_function->getConfiguration();
         size_t command_parameters_size = configuration.parameters.size();
         if (command_parameters_size != parameters_.size())
-            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
                 "Executable user defined function {} number of parameters does not match. Expected {}. Actual {}",
                 configuration.name,
                 command_parameters_size,
@@ -99,7 +103,8 @@ public:
 
             if (!find_placedholder)
             {
-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS,
                     "Executable user defined function {} no placeholder for parameter {}",
                     configuration.name,
                     command_parameter.name);
@@ -130,36 +135,94 @@ public:
         if (input_rows_count == 0)
             return result_type->createColumn();
 
-        auto coordinator = executable_function->getCoordinator();
-        const auto & coordinator_configuration = coordinator->getConfiguration();
         const auto & configuration = executable_function->getConfiguration();
+        
+        // Check if using shared_memory mode
+        auto process_pool = executable_function->getProcessPool();
+        auto coordinator = executable_function->getCoordinator();
+        
+        if (!process_pool && !coordinator)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "User defined function '{}': neither process pool nor coordinator available",
+                configuration.name);
 
         String command = command_with_parameters;
+        auto arguments_for_execution = command_arguments_with_parameters;
 
-        if (coordinator_configuration.execute_direct)
+        // Dynamic AI parameter loading at execution time (when need_ai_model is true)
+        if (configuration.need_ai_model)
         {
-            auto user_scripts_path = context->getUserScriptsPath();
-            auto script_path = user_scripts_path + '/' + command;
+            // Load AI parameters from context at execution time (not from stored config)
+            String ai_model_name = context->getSettingsRef()[Setting::ai_model_name];
+            String ai_api_key = context->getSettingsRef()[Setting::ai_api_key];
+            String ai_base_url = context->getSettingsRef()[Setting::ai_base_url];
+            UInt64 ai_max_concurrent_requests = context->getSettingsRef()[Setting::ai_max_concurrent_requests];
+            UInt64 ai_request_timeout = context->getSettingsRef()[Setting::ai_request_timeout];
+            UInt64 ai_max_batch_size = context->getSettingsRef()[Setting::ai_max_batch_size];
 
-            if (!fileOrSymlinkPathStartsWith(script_path, user_scripts_path))
-                throw Exception(ErrorCodes::UNSUPPORTED_METHOD,
-                    "Executable file {} must be inside user scripts folder {}",
-                    command,
-                    user_scripts_path);
+            // Validate that required AI configuration parameters exist
+            if (ai_model_name.empty() || ai_api_key.empty() || ai_base_url.empty())
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS,
+                    "User defined function '{}' with need_ai_model=true requires all AI configuration parameters: "
+                    "ai_model_name, ai_api_key, and ai_base_url must be specified",
+                    configuration.name);
 
-            if (!FS::exists(script_path))
-                throw Exception(ErrorCodes::UNSUPPORTED_METHOD,
-                    "Executable file {} does not exist inside user scripts folder {}",
-                    command,
-                    user_scripts_path);
+            // Clear existing arguments (to avoid duplicates from stored config)
+            arguments_for_execution.clear();
 
-            if (!FS::canExecute(script_path))
-                throw Exception(ErrorCodes::UNSUPPORTED_METHOD,
-                    "Executable file {} is not executable inside user scripts folder {}",
-                    command,
-                    user_scripts_path);
+            // Rebuild arguments with fresh AI parameters from context
+            // Position 0: model_name
+            // Position 1: api_key
+            // Position 2: base_url
+            // Position 3: max_concurrent_requests
+            // Position 4: request_timeout
+            // Position 5: max_batch_size
+            // Position 6: format (data format parameter)
 
-            command = std::move(script_path);
+            arguments_for_execution.push_back(ai_model_name);
+            arguments_for_execution.push_back(ai_api_key);
+            arguments_for_execution.push_back(ai_base_url);
+            arguments_for_execution.push_back(std::to_string(ai_max_concurrent_requests));
+            arguments_for_execution.push_back(std::to_string(ai_request_timeout));
+            arguments_for_execution.push_back(std::to_string(ai_max_batch_size));
+
+            // Add format parameter
+            arguments_for_execution.push_back(configuration.data_format);
+        }
+
+        // Handle execute_direct only for pipe mode (coordinator has this config)
+        if (coordinator)
+        {
+            const auto & coordinator_configuration = coordinator->getConfiguration();
+            if (coordinator_configuration.execute_direct)
+            {
+                auto user_scripts_path = context->getUserScriptsPath();
+                auto script_path = user_scripts_path + '/' + command;
+
+                if (!fileOrSymlinkPathStartsWith(script_path, user_scripts_path))
+                    throw Exception(
+                        ErrorCodes::UNSUPPORTED_METHOD,
+                        "Executable file {} must be inside user scripts folder {}",
+                        command,
+                        user_scripts_path);
+
+                if (!FS::exists(script_path))
+                    throw Exception(
+                        ErrorCodes::UNSUPPORTED_METHOD,
+                        "Executable file {} does not exist inside user scripts folder {}",
+                        command,
+                        user_scripts_path);
+
+                if (!FS::canExecute(script_path))
+                    throw Exception(
+                        ErrorCodes::UNSUPPORTED_METHOD,
+                        "Executable file {} is not executable inside user scripts folder {}",
+                        command,
+                        user_scripts_path);
+
+                command = std::move(script_path);
+            }
         }
 
         size_t argument_size = arguments.size();
@@ -191,50 +254,92 @@ public:
             Block result_block({result});
 
             Block arguments_block(arguments_copy);
-            auto source = std::make_shared<SourceFromSingleChunk>(std::make_shared<const Block>(std::move(arguments_block)));
-            auto shell_input_pipe = Pipe(std::move(source));
-
-            ShellCommandSourceConfiguration shell_command_source_configuration;
-
-            if (coordinator_configuration.is_executable_pool)
+            
+            // Choose execution path based on transport mode
+            if (process_pool)
             {
-                shell_command_source_configuration.read_fixed_number_of_rows = true;
-                shell_command_source_configuration.number_of_rows_to_read = input_rows_count;
+                // Shared memory mode: direct execution via process pool
+                // When borrowing a process, we can pass dynamic arguments (for need_ai_model=true)
+                ExecutableProcessInstance instance;
+                process_pool->borrowProcess(instance, arguments_for_execution);
+                
+                try
+                {
+                    Block result_block_with_data = instance.execute(arguments_block, result_block);
+                    
+                    // Successfully executed, return process to pool for reuse
+                    process_pool->returnProcess(std::move(instance));
+                    
+                    auto result_column = result_block_with_data.getByPosition(0).column;
+                    size_t result_column_size = result_column->size();
+                    
+                    if (result_column_size != input_rows_count)
+                        throw Exception(
+                            ErrorCodes::UNSUPPORTED_METHOD,
+                            "Function {}: wrong result, expected {} row(s), actual {}",
+                            quoteString(getName()),
+                            input_rows_count,
+                            result_column_size);
+                    
+                    return result_column;
+                }
+                catch (...)
+                {
+                    // If execute() failed, the process is likely unhealthy
+                    // Don't return it to pool - just let it be destroyed
+                    // The destructor will clean up all resources (SharedMemory, UDS, subprocess)
+                    throw;
+                }
             }
-
-            Pipes shell_input_pipes;
-            shell_input_pipes.emplace_back(std::move(shell_input_pipe));
-
-            Pipe pipe = coordinator->createPipe(
-                command,
-                command_arguments_with_parameters,
-                std::move(shell_input_pipes),
-                result_block,
-                context,
-                shell_command_source_configuration);
-
-            QueryPipeline pipeline(std::move(pipe));
-            PullingPipelineExecutor executor(pipeline);
-
-            auto result_column = result_type->createColumn();
-            result_column->reserve(input_rows_count);
-
-            Block block;
-            while (executor.pull(block))
+            else
             {
-                const auto & result_column_to_add = *block.safeGetByPosition(0).column;
-                result_column->insertRangeFrom(result_column_to_add, 0, result_column_to_add.size());
+                // Pipe mode: traditional pipeline execution
+                auto source = std::make_shared<SourceFromSingleChunk>(std::make_shared<const Block>(std::move(arguments_block)));
+                auto shell_input_pipe = Pipe(std::move(source));
+
+                Pipes shell_input_pipes;
+                shell_input_pipes.emplace_back(std::move(shell_input_pipe));
+
+                const auto & coordinator_configuration = coordinator->getConfiguration();
+                ShellCommandSourceConfiguration shell_command_source_configuration;
+                if (coordinator_configuration.is_executable_pool)
+                {
+                    shell_command_source_configuration.read_fixed_number_of_rows = true;
+                    shell_command_source_configuration.number_of_rows_to_read = input_rows_count;
+                }
+
+                Pipe pipe = coordinator->createPipe(
+                    command,
+                    arguments_for_execution,
+                    std::move(shell_input_pipes),
+                    result_block,
+                    context,
+                    shell_command_source_configuration);
+
+                QueryPipeline pipeline(std::move(pipe));
+                PullingPipelineExecutor executor(pipeline);
+
+                auto result_column = result_type->createColumn();
+                result_column->reserve(input_rows_count);
+
+                Block block;
+                while (executor.pull(block))
+                {
+                    const auto & result_column_to_add = *block.safeGetByPosition(0).column;
+                    result_column->insertRangeFrom(result_column_to_add, 0, result_column_to_add.size());
+                }
+
+                size_t result_column_size = result_column->size();
+                if (result_column_size != input_rows_count)
+                    throw Exception(
+                        ErrorCodes::UNSUPPORTED_METHOD,
+                        "Function {}: wrong result, expected {} row(s), actual {}",
+                        quoteString(getName()),
+                        input_rows_count,
+                        result_column_size);
+
+                return result_column;
             }
-
-            size_t result_column_size = result_column->size();
-            if (result_column_size != input_rows_count)
-                throw Exception(ErrorCodes::UNSUPPORTED_METHOD,
-                    "Function {}: wrong result, expected {} row(s), actual {}",
-                    quoteString(getName()),
-                    input_rows_count,
-                    result_column_size);
-
-            return result_column;
         }
         catch (...)
         {
@@ -245,7 +350,8 @@ public:
 
             String error_message = getCurrentExceptionMessage(true /* with_stacktrace */);
 
-            throw Exception(ErrorCodes::UDF_EXECUTION_FAILED,
+            throw Exception(
+                ErrorCodes::UDF_EXECUTION_FAILED,
                 "User defined function '{}' failed. "
                 "Command: '{}', Arguments: [{}]. "
                 "Original error: {}",
@@ -263,7 +369,6 @@ private:
     String command_with_parameters;
     std::vector<String> command_arguments_with_parameters;
 };
-
 }
 
 UserDefinedExecutableFunctionFactory & UserDefinedExecutableFunctionFactory::instance()
