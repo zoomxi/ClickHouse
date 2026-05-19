@@ -1,5 +1,7 @@
 #include <Storages/Statistics/StatisticsBasic.h>
 
+#include <Columns/ColumnLowCardinality.h>
+#include <Columns/ColumnNullable.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/IDataType.h>
@@ -48,7 +50,37 @@ void StatisticsBasic::build(const ColumnPtr & column)
             max = max_field;
     }
 
-    /// null_count and string lengths are filled in Tasks 3 and 4.
+    /// null_count for Nullable / LowCardinality(Nullable)
+    UInt64 nulls_in_chunk = 0;
+    bool is_nullable_col = false;
+
+    if (const auto * nullable = checkAndGetColumn<ColumnNullable>(full_column.get()))
+    {
+        const auto & null_map = nullable->getNullMapData();
+        nulls_in_chunk = std::count(null_map.begin(), null_map.end(), 1);
+        is_nullable_col = true;
+    }
+    else if (const auto * lc = checkAndGetColumn<ColumnLowCardinality>(full_column.get()))
+    {
+        if (lc->nestedIsNullable())
+        {
+            size_t null_index = lc->getDictionary().getNullValueIndex();
+            const auto & indexes = lc->getIndexes();
+            for (size_t i = 0; i < indexes.size(); ++i)
+                if (indexes.getUInt(i) == null_index)
+                    ++nulls_in_chunk;
+            is_nullable_col = true;
+        }
+    }
+
+    if (is_nullable_col)
+    {
+        if (!null_count.has_value())
+            null_count = 0;
+        *null_count += nulls_in_chunk;
+    }
+
+    /// String lengths are filled in Task 4.
 }
 
 void StatisticsBasic::merge(const StatisticsPtr & /*other_stats*/)

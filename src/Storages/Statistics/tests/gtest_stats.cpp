@@ -4,7 +4,9 @@
 #include <Common/tests/gtest_global_register.h>
 
 #include <Columns/IColumn.h>
+#include <Columns/ColumnNullable.h>
 #include <Columns/ColumnsNumber.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Interpreters/convertFieldToType.h>
 #include <Storages/MergeTree/RPNBuilder.h>
@@ -273,5 +275,37 @@ TEST(StatisticsBasic, BuildNumeric)
     EXPECT_EQ(basic.getMin().safeGet<Int64>(), 1);
     EXPECT_EQ(basic.getMax().safeGet<Int64>(), 5);
     EXPECT_FALSE(basic.hasNullCount());
+    EXPECT_FALSE(basic.hasStringLengths());
+}
+
+TEST(StatisticsBasic, BuildNullable)
+{
+    auto data_type = std::make_shared<DataTypeNullable>(std::make_shared<DataTypeInt32>());
+    SingleStatisticsDescription desc(StatisticsType::MinMax, nullptr, false);
+
+    StatisticsBasic basic(desc, data_type);
+
+    /// Build a Nullable(Int32) column [10, NULL, 5, NULL, 7]
+    auto inner = ColumnInt32::create();
+    inner->insert(Field(Int64(10)));
+    inner->insert(Field(Int64(0)));     /// dummy under NULL mask
+    inner->insert(Field(Int64(5)));
+    inner->insert(Field(Int64(0)));     /// dummy under NULL mask
+    inner->insert(Field(Int64(7)));
+    auto null_map = ColumnUInt8::create();
+    null_map->insert(Field(UInt64(0)));
+    null_map->insert(Field(UInt64(1)));
+    null_map->insert(Field(UInt64(0)));
+    null_map->insert(Field(UInt64(1)));
+    null_map->insert(Field(UInt64(0)));
+    auto col = ColumnNullable::create(std::move(inner), std::move(null_map));
+
+    basic.build(std::move(col));
+
+    EXPECT_TRUE(basic.hasMinMax());
+    EXPECT_EQ(basic.getMin().safeGet<Int64>(), 5);
+    EXPECT_EQ(basic.getMax().safeGet<Int64>(), 10);
+    EXPECT_TRUE(basic.hasNullCount());
+    EXPECT_EQ(basic.getNullCount(), 2u);
     EXPECT_FALSE(basic.hasStringLengths());
 }
