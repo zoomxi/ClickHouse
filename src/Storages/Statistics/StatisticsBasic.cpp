@@ -98,17 +98,22 @@ void StatisticsBasic::build(const ColumnPtr & column)
         /// itself — it dispatches through the dictionary index for each row, so iteration is row-aligned.
 
         const size_t rows = full_column->size();
+
+        const IColumn * lc_indexes = nullptr;
+        size_t lc_null_index = 0;
+        if (lc_with_null)
+        {
+            lc_indexes = &lc_with_null->getIndexes();
+            lc_null_index = lc_with_null->getDictionary().getNullValueIndex();
+        }
+
         for (size_t i = 0; i < rows; ++i)
         {
             if (null_map_ptr && (*null_map_ptr)[i])
                 continue;
-            if (lc_with_null)
-            {
-                const auto & indexes = lc_with_null->getIndexes();
-                const size_t null_index = lc_with_null->getDictionary().getNullValueIndex();
-                if (indexes.getUInt(i) == null_index)
-                    continue;
-            }
+            if (lc_indexes && lc_indexes->getUInt(i) == lc_null_index)
+                continue;
+
             /// `getDataAt(i).size()` returns the variable-length payload for `ColumnString` and the
             /// fixed (padded) width for `ColumnFixedString` — both are byte counts, matching the spec's
             /// "shortest/longest value length" semantics.
