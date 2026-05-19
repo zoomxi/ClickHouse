@@ -146,16 +146,17 @@ void StatisticsBasic::merge(const StatisticsPtr & other_stats)
         *null_count += *other->null_count;
     }
 
-    /// String lengths: min of mins, max of maxes
+    /// String lengths: min of mins, max of maxes. Assign the optional directly (rather than
+    /// dereferencing then re-wrapping) to avoid `bugprone-optional-value-conversion`.
     if (other->min_length.has_value())
     {
         if (!min_length.has_value() || *other->min_length < *min_length)
-            min_length = *other->min_length;
+            min_length = other->min_length;
     }
     if (other->max_length.has_value())
     {
         if (!max_length.has_value() || *other->max_length > *max_length)
-            max_length = *other->max_length;
+            max_length = other->max_length;
     }
 }
 
