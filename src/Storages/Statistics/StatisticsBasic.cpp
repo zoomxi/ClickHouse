@@ -1,7 +1,9 @@
 #include <Storages/Statistics/StatisticsBasic.h>
 
+#include <Columns/ColumnFixedString.h>
 #include <Columns/ColumnLowCardinality.h>
 #include <Columns/ColumnNullable.h>
+#include <Columns/ColumnString.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/IDataType.h>
@@ -50,14 +52,18 @@ void StatisticsBasic::build(const ColumnPtr & column)
             max = max_field;
     }
 
-    /// null_count for Nullable / LowCardinality(Nullable)
+    /// `null_count` for `Nullable` / `LowCardinality(Nullable)`. Also records the null-map / LC pointers so the
+    /// string-length block below can skip NULL rows without re-detecting the wrapper.
     UInt64 nulls_in_chunk = 0;
     bool is_nullable_col = false;
+    const NullMap * null_map_ptr = nullptr;
+    const ColumnLowCardinality * lc_with_null = nullptr;
 
     if (const auto * nullable = checkAndGetColumn<ColumnNullable>(full_column.get()))
     {
         const auto & null_map = nullable->getNullMapData();
         nulls_in_chunk = std::count(null_map.begin(), null_map.end(), 1);
+        null_map_ptr = &null_map;
         is_nullable_col = true;
     }
     else if (const auto * lc = checkAndGetColumn<ColumnLowCardinality>(full_column.get()))
@@ -69,6 +75,7 @@ void StatisticsBasic::build(const ColumnPtr & column)
             for (size_t i = 0; i < indexes.size(); ++i)
                 if (indexes.getUInt(i) == null_index)
                     ++nulls_in_chunk;
+            lc_with_null = lc;
             is_nullable_col = true;
         }
     }
@@ -80,7 +87,38 @@ void StatisticsBasic::build(const ColumnPtr & column)
         *null_count += nulls_in_chunk;
     }
 
-    /// String lengths are filled in Task 4.
+    /// `String` / `FixedString` min/max byte length. Resolves through `Nullable` / `LowCardinality` wrappers
+    /// so iteration is row-aligned regardless of how the column is wrapped.
+    if (isStringOrFixedString(data_type))
+    {
+        const IColumn * row_aligned = full_column.get();
+        if (const auto * nullable = checkAndGetColumn<ColumnNullable>(row_aligned))
+            row_aligned = &nullable->getNestedColumn();
+        /// For `LowCardinality` wrappers (with or without `Nullable`), call `getDataAt` on the LC column
+        /// itself — it dispatches through the dictionary index for each row, so iteration is row-aligned.
+
+        const size_t rows = full_column->size();
+        for (size_t i = 0; i < rows; ++i)
+        {
+            if (null_map_ptr && (*null_map_ptr)[i])
+                continue;
+            if (lc_with_null)
+            {
+                const auto & indexes = lc_with_null->getIndexes();
+                const size_t null_index = lc_with_null->getDictionary().getNullValueIndex();
+                if (indexes.getUInt(i) == null_index)
+                    continue;
+            }
+            /// `getDataAt(i).size()` returns the variable-length payload for `ColumnString` and the
+            /// fixed (padded) width for `ColumnFixedString` — both are byte counts, matching the spec's
+            /// "shortest/longest value length" semantics.
+            UInt64 len = row_aligned->getDataAt(i).size();
+            if (!min_length.has_value() || len < *min_length)
+                min_length = len;
+            if (!max_length.has_value() || len > *max_length)
+                max_length = len;
+        }
+    }
 }
 
 void StatisticsBasic::merge(const StatisticsPtr & /*other_stats*/)

@@ -5,8 +5,10 @@
 
 #include <Columns/IColumn.h>
 #include <Columns/ColumnNullable.h>
+#include <Columns/ColumnString.h>
 #include <Columns/ColumnsNumber.h>
 #include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Interpreters/convertFieldToType.h>
 #include <Storages/MergeTree/RPNBuilder.h>
@@ -308,4 +310,53 @@ TEST(StatisticsBasic, BuildNullable)
     EXPECT_TRUE(basic.hasNullCount());
     EXPECT_EQ(basic.getNullCount(), 2u);
     EXPECT_FALSE(basic.hasStringLengths());
+}
+
+TEST(StatisticsBasic, BuildString)
+{
+    auto data_type = std::make_shared<DataTypeString>();
+    SingleStatisticsDescription desc(StatisticsType::MinMax, nullptr, false);
+
+    StatisticsBasic basic(desc, data_type);
+
+    auto col = ColumnString::create();
+    col->insertData("aa", 2);
+    col->insertData("hello", 5);
+    col->insertData("x", 1);
+    col->insertData("worlds", 6);
+
+    basic.build(std::move(col));
+
+    EXPECT_FALSE(basic.hasMinMax());          /// String columns: no numeric min/max
+    EXPECT_FALSE(basic.hasNullCount());       /// String, not Nullable
+    EXPECT_TRUE(basic.hasStringLengths());
+    EXPECT_EQ(basic.getMinLength(), 1u);
+    EXPECT_EQ(basic.getMaxLength(), 6u);
+}
+
+TEST(StatisticsBasic, BuildNullableString)
+{
+    auto data_type = std::make_shared<DataTypeNullable>(std::make_shared<DataTypeString>());
+    SingleStatisticsDescription desc(StatisticsType::MinMax, nullptr, false);
+
+    StatisticsBasic basic(desc, data_type);
+
+    auto inner = ColumnString::create();
+    inner->insertData("ab", 2);
+    inner->insertData("",   0);   /// masked as NULL — must NOT contribute length 0
+    inner->insertData("xyz", 3);
+    auto null_map = ColumnUInt8::create();
+    null_map->insert(Field(UInt64(0)));
+    null_map->insert(Field(UInt64(1)));
+    null_map->insert(Field(UInt64(0)));
+    auto col = ColumnNullable::create(std::move(inner), std::move(null_map));
+
+    basic.build(std::move(col));
+
+    EXPECT_FALSE(basic.hasMinMax());
+    EXPECT_TRUE(basic.hasNullCount());
+    EXPECT_EQ(basic.getNullCount(), 1u);
+    EXPECT_TRUE(basic.hasStringLengths());
+    EXPECT_EQ(basic.getMinLength(), 2u);
+    EXPECT_EQ(basic.getMaxLength(), 3u);
 }
