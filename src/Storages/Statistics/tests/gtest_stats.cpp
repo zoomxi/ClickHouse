@@ -256,8 +256,6 @@ TEST(Statistics, LikeSelectivity)
 
 TEST(StatisticsBasic, BuildNumeric)
 {
-    using namespace DB;
-
     auto data_type = std::make_shared<DataTypeInt32>();
     SingleStatisticsDescription desc(StatisticsType::MinMax, nullptr, false);
 

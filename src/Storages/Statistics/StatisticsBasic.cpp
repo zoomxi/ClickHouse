@@ -80,11 +80,14 @@ String StatisticsBasic::getNameForLogs() const
 
 bool basicStatisticsValidator(const SingleStatisticsDescription &, const DataTypePtr & data_type)
 {
-    auto inner = removeLowCardinality(removeNullable(data_type));
+    auto inner = removeLowCardinalityAndNullable(data_type);
     if (inner->isValueRepresentedByNumber())
         return true;
     if (isStringOrFixedString(inner))
         return true;
+    /// Catches Nullable / LowCardinality(Nullable) wrappers whose inner is neither numeric
+    /// nor string (e.g. Nullable(UUID), Nullable(Tuple(...))) — `Basic` still tracks `null_count`
+    /// for these in `build()`.
     if (isNullableOrLowCardinalityNullable(data_type))
         return true;
     return false;
