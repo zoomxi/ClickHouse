@@ -47,6 +47,10 @@ public:
     void setMinMax(Field min_, Field max_) { min = std::move(min_); max = std::move(max_); }
     void setNullCount(UInt64 null_count_) { null_count = null_count_; }
 
+    /// Used by `ColumnStatistics::estimateLess` and tests to feed the row count
+    /// from the outer `ColumnStatistics` into the per-stat estimator. Not serialized.
+    void setNonNullRowCount(UInt64 rows_) { non_null_row_count = rows_; }
+
     std::optional<Float64> estimateLess(const Field & val) const override;
     String getNameForLogs() const override;
 
@@ -58,6 +62,9 @@ private:
     std::optional<UInt64> null_count;
     std::optional<UInt64> min_length;
     std::optional<UInt64> max_length;
+
+    /// Transient: not serialized; set just before `estimateLess` is invoked.
+    UInt64 non_null_row_count = 0;
 };
 
 bool basicStatisticsValidator(const SingleStatisticsDescription & description, const DataTypePtr & data_type);

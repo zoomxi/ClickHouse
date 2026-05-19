@@ -448,3 +448,18 @@ TEST(StatisticsBasic, V3RoundTripNumeric)
     EXPECT_FALSE(reread.hasNullCount());
     EXPECT_FALSE(reread.hasStringLengths());
 }
+
+TEST(StatisticsBasic, EstimateLessNumeric)
+{
+    auto data_type = std::make_shared<DataTypeInt32>();
+    SingleStatisticsDescription desc(StatisticsType::MinMax, nullptr, false);
+
+    StatisticsBasic basic(desc, data_type);
+    basic.setMinMax(Field(Int64(0)), Field(Int64(100)));
+    basic.setNonNullRowCount(100);
+
+    auto less_50 = basic.estimateLess(Field(Int64(50)));
+    ASSERT_TRUE(less_50.has_value());
+    /// Linear interpolation on [0, 100] for predicate < 50 with 100 rows -> ~50 rows.
+    EXPECT_NEAR(*less_50, 50.0, 0.5);
+}

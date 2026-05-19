@@ -20,7 +20,6 @@ namespace DB
 
 namespace ErrorCodes
 {
-    extern const int NOT_IMPLEMENTED;
     extern const int LOGICAL_ERROR;
     extern const int ILLEGAL_STATISTICS;
 }
@@ -255,9 +254,58 @@ void StatisticsBasic::deserialize(ReadBuffer & buf, StatisticsFileVersion versio
     }
 }
 
-std::optional<Float64> StatisticsBasic::estimateLess(const Field & /*val*/) const
+namespace
 {
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "StatisticsBasic::estimateLess not implemented yet");
+
+template <typename T> struct WiderIntType { using type = T; };
+template <> struct WiderIntType<UInt64>  { using type = UInt128; };
+template <> struct WiderIntType<Int64>   { using type = Int128; };
+template <> struct WiderIntType<UInt128> { using type = UInt256; };
+template <> struct WiderIntType<Int128>  { using type = Int256; };
+
+template <typename T>
+Float64 interpolateLinear(Field val, Field min, Field max, UInt64 row_count)
+{
+    T v = val.safeGet<T>();
+    T mn = min.safeGet<T>();
+    T mx = max.safeGet<T>();
+    if (v < mn) return 0.0;
+    if (v > mx) return static_cast<Float64>(row_count);
+    if (mn == mx) return (v == mx) ? static_cast<Float64>(row_count) : 0.0;
+    using W = typename WiderIntType<T>::type;
+    return static_cast<Float64>(static_cast<W>(v) - static_cast<W>(mn))
+         / static_cast<Float64>(static_cast<W>(mx) - static_cast<W>(mn))
+         * static_cast<Float64>(row_count);
+}
+
+}
+
+std::optional<Float64> StatisticsBasic::estimateLess(const Field & val) const
+{
+    if (non_null_row_count == 0 || min.isNull() || max.isNull())
+        return std::nullopt;
+
+    if (val.getType() == min.getType() && val.getType() == max.getType())
+    {
+        switch (val.getType())
+        {
+            case Field::Types::UInt64:  return interpolateLinear<UInt64>(val, min, max, non_null_row_count);
+            case Field::Types::Int64:   return interpolateLinear<Int64>(val, min, max, non_null_row_count);
+            case Field::Types::UInt128: return interpolateLinear<UInt128>(val, min, max, non_null_row_count);
+            case Field::Types::Int128:  return interpolateLinear<Int128>(val, min, max, non_null_row_count);
+            case Field::Types::UInt256: return interpolateLinear<UInt256>(val, min, max, non_null_row_count);
+            case Field::Types::Int256:  return interpolateLinear<Int256>(val, min, max, non_null_row_count);
+            case Field::Types::Float64: return interpolateLinear<Float64>(val, min, max, non_null_row_count);
+            default: break;
+        }
+    }
+
+    auto val_as_float = StatisticsUtils::tryConvertToFloat64(val, data_type);
+    auto min_as_float = StatisticsUtils::tryConvertToFloat64(min, data_type);
+    auto max_as_float = StatisticsUtils::tryConvertToFloat64(max, data_type);
+    if (!val_as_float || !min_as_float || !max_as_float)
+        return std::nullopt;
+    return interpolateLinear<Float64>(*val_as_float, *min_as_float, *max_as_float, non_null_row_count);
 }
 
 /// TODO: when Tasks 2-7 populate min/max/null_count/string lengths, evolve this to print actual field values
