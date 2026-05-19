@@ -11,6 +11,8 @@
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Interpreters/convertFieldToType.h>
+#include <IO/ReadBufferFromString.h>
+#include <IO/WriteBufferFromString.h>
 #include <Storages/MergeTree/RPNBuilder.h>
 #include <Storages/Statistics/Statistics.h>
 #include <Storages/Statistics/StatisticsBasic.h>
@@ -380,4 +382,69 @@ TEST(StatisticsBasic, Merge)
     EXPECT_EQ(a->getMin().safeGet<Int64>(), 1);
     EXPECT_EQ(a->getMax().safeGet<Int64>(), 8);
     EXPECT_EQ(a->getNullCount(), 10u);
+}
+
+TEST(StatisticsBasic, V3RoundTrip)
+{
+    auto data_type = std::make_shared<DataTypeNullable>(std::make_shared<DataTypeString>());
+    SingleStatisticsDescription desc(StatisticsType::MinMax, nullptr, false);
+
+    auto orig = std::make_shared<StatisticsBasic>(desc, data_type);
+    /// String column: no numeric min/max; has null_count and string lengths after build().
+    auto inner = ColumnString::create();
+    inner->insertData("ab", 2);
+    inner->insertData("longer", 6);
+    auto null_map = ColumnUInt8::create();
+    null_map->insert(Field(UInt64(0)));
+    null_map->insert(Field(UInt64(0)));
+    auto src = ColumnNullable::create(std::move(inner), std::move(null_map));
+    orig->build(std::move(src));
+    /// Manually overwrite null_count to a non-default value to verify it round-trips.
+    orig->setNullCount(7);
+
+    String buffer;
+    {
+        WriteBufferFromString out(buffer);
+        orig->serialize(out);
+    }
+
+    auto reread = std::make_shared<StatisticsBasic>(desc, data_type);
+    {
+        ReadBufferFromString in(buffer);
+        reread->deserialize(in, StatisticsFileVersion::V3);
+    }
+
+    EXPECT_FALSE(reread->hasMinMax());
+    EXPECT_TRUE(reread->hasNullCount());
+    EXPECT_EQ(reread->getNullCount(), 7u);
+    EXPECT_TRUE(reread->hasStringLengths());
+    EXPECT_EQ(reread->getMinLength(), 2u);
+    EXPECT_EQ(reread->getMaxLength(), 6u);
+}
+
+TEST(StatisticsBasic, V3RoundTripNumeric)
+{
+    auto data_type = std::make_shared<DataTypeInt32>();
+    SingleStatisticsDescription desc(StatisticsType::MinMax, nullptr, false);
+
+    StatisticsBasic orig(desc, data_type);
+    orig.setMinMax(Field(Int64(-3)), Field(Int64(42)));
+
+    String buffer;
+    {
+        WriteBufferFromString out(buffer);
+        orig.serialize(out);
+    }
+
+    StatisticsBasic reread(desc, data_type);
+    {
+        ReadBufferFromString in(buffer);
+        reread.deserialize(in, StatisticsFileVersion::V3);
+    }
+
+    EXPECT_TRUE(reread.hasMinMax());
+    EXPECT_EQ(reread.getMin().safeGet<Int64>(), -3);
+    EXPECT_EQ(reread.getMax().safeGet<Int64>(), 42);
+    EXPECT_FALSE(reread.hasNullCount());
+    EXPECT_FALSE(reread.hasStringLengths());
 }

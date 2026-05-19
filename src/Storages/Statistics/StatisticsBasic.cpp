@@ -4,9 +4,13 @@
 #include <Columns/ColumnLowCardinality.h>
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
+#include <DataTypes/DataTypeFactory.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/IDataType.h>
+#include <Interpreters/convertFieldToType.h>
+#include <IO/ReadHelpers.h>
+#include <IO/WriteHelpers.h>
 
 #include <Common/Exception.h>
 
@@ -18,6 +22,7 @@ namespace ErrorCodes
 {
     extern const int NOT_IMPLEMENTED;
     extern const int LOGICAL_ERROR;
+    extern const int ILLEGAL_STATISTICS;
 }
 
 StatisticsBasic::StatisticsBasic(const SingleStatisticsDescription & description, const DataTypePtr & data_type_)
@@ -160,14 +165,94 @@ void StatisticsBasic::merge(const StatisticsPtr & other_stats)
     }
 }
 
-void StatisticsBasic::serialize(WriteBuffer & /*buf*/)
+void StatisticsBasic::serialize(WriteBuffer & buf)
 {
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "StatisticsBasic::serialize not implemented yet");
+    /// Layout (V3 Basic payload):
+    ///   [u8 has_minmax]
+    ///   if has_minmax:
+    ///       [string type_name][Field min][Field max]
+    ///   [u8 has_null_count]
+    ///   if has_null_count:
+    ///       [u64 null_count]
+    ///   [u8 has_string_lengths]
+    ///   if has_string_lengths:
+    ///       [u64 min_length][u64 max_length]
+    ///
+    /// The outer envelope (version + mask + total_rows + per-stat size prefix) is written by
+    /// `ColumnStatistics::serialize`.
+
+    UInt8 has_minmax = hasMinMax() ? 1 : 0;
+    writeIntBinary(has_minmax, buf);
+    if (has_minmax)
+    {
+        writeStringBinary(data_type->getName(), buf);
+        writeFieldBinary(min, buf);
+        writeFieldBinary(max, buf);
+    }
+
+    UInt8 has_null_count = hasNullCount() ? 1 : 0;
+    writeIntBinary(has_null_count, buf);
+    if (has_null_count)
+        writeIntBinary(*null_count, buf);
+
+    UInt8 has_string_lengths = hasStringLengths() ? 1 : 0;
+    writeIntBinary(has_string_lengths, buf);
+    if (has_string_lengths)
+    {
+        writeIntBinary(*min_length, buf);
+        writeIntBinary(*max_length, buf);
+    }
 }
 
-void StatisticsBasic::deserialize(ReadBuffer & /*buf*/, StatisticsFileVersion /*version*/)
+void StatisticsBasic::deserialize(ReadBuffer & buf, StatisticsFileVersion version)
 {
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "StatisticsBasic::deserialize not implemented yet");
+    if (version != StatisticsFileVersion::V3)
+        throw Exception(
+            ErrorCodes::ILLEGAL_STATISTICS,
+            "`StatisticsBasic::deserialize`: only V3 is supported here. Legacy V1/V2 payloads must be "
+            "translated by `ColumnStatistics::deserialize`. Got version {}",
+            static_cast<UInt16>(version));
+
+    UInt8 has_minmax;
+    readIntBinary(has_minmax, buf);
+    if (has_minmax)
+    {
+        String stored_type_name;
+        readStringBinary(stored_type_name, buf);
+        min = readFieldBinary(buf);
+        max = readFieldBinary(buf);
+
+        if (stored_type_name != data_type->getName())
+        {
+            /// Column type changed since stats were written — convert the stored fields.
+            auto stored_type = DataTypeFactory::instance().get(stored_type_name);
+            if (!min.isNull())
+                min = convertFieldToType(min, *data_type, stored_type.get());
+            if (!max.isNull())
+                max = convertFieldToType(max, *data_type, stored_type.get());
+        }
+    }
+
+    UInt8 has_null_count;
+    readIntBinary(has_null_count, buf);
+    if (has_null_count)
+    {
+        UInt64 nc;
+        readIntBinary(nc, buf);
+        null_count = nc;
+    }
+
+    UInt8 has_string_lengths;
+    readIntBinary(has_string_lengths, buf);
+    if (has_string_lengths)
+    {
+        UInt64 mn;
+        UInt64 mx;
+        readIntBinary(mn, buf);
+        readIntBinary(mx, buf);
+        min_length = mn;
+        max_length = mx;
+    }
 }
 
 std::optional<Float64> StatisticsBasic::estimateLess(const Field & /*val*/) const

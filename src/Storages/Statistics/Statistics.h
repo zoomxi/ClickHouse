@@ -20,6 +20,7 @@ enum class StatisticsFileVersion : UInt16
     V0 = 0,
     V1 = 1, /// modified the format of uniq, https://github.com/ClickHouse/ClickHouse/pull/90311
     V2 = 2, /// minmax statistics now serialize Field type and use Field instead of Float64
+    V3 = 3, /// Basic schema: per-stat size prefix + has_minmax / has_null_count / has_string_lengths flags
 };
 
 class Field;
