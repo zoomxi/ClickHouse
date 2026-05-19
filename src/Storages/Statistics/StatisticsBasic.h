@@ -38,7 +38,8 @@ public:
     bool hasNullCount() const { return null_count.has_value(); }
     UInt64 getNullCount() const { return null_count.value_or(0); }
 
-    bool hasStringLengths() const { return min_length.has_value(); }
+    /// `min_length` and `max_length` are populated together by `build` / `deserialize`, so checking either suffices.
+    bool hasStringLengths() const { return min_length.has_value() && max_length.has_value(); }
     UInt64 getMinLength() const { return min_length.value_or(0); }
     UInt64 getMaxLength() const { return max_length.value_or(0); }
 
@@ -50,7 +51,7 @@ public:
     String getNameForLogs() const override;
 
 private:
-    DataTypePtr data_type;          /// removeNullable-d inner type (mirrors today's StatisticsMinMax::data_type)
+    DataTypePtr data_type;          /// inner type after `removeNullable` + `removeLowCardinality` stripping
 
     Field min;                      /// null Field == "no observation"
     Field max;                      /// null Field == "no observation"

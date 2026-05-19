@@ -22,7 +22,8 @@ StatisticsBasic::StatisticsBasic(const SingleStatisticsDescription & description
 }
 
 StatisticsBasic::StatisticsBasic(Field min_, Field max_, std::optional<UInt64> null_count_)
-    : IStatistics(SingleStatisticsDescription(static_cast<StatisticsType>(3), nullptr, false))
+    /// `StatisticsType::MinMax` is the slot `Basic` will eventually claim — Task 8 globally renames the enum value to `Basic`.
+    : IStatistics(SingleStatisticsDescription(StatisticsType::MinMax, nullptr, false))
     , min(std::move(min_))
     , max(std::move(max_))
     , null_count(null_count_)
@@ -54,6 +55,8 @@ std::optional<Float64> StatisticsBasic::estimateLess(const Field & /*val*/) cons
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "StatisticsBasic::estimateLess not implemented yet");
 }
 
+/// TODO: when Tasks 2-7 populate min/max/null_count/string lengths, evolve this to print actual field values
+/// (similar to today's `StatisticsMinMax::getNameForLogs` which prints "MinMax: ({min}, {max})").
 String StatisticsBasic::getNameForLogs() const
 {
     return "Basic";
