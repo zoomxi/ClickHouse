@@ -126,9 +126,37 @@ void StatisticsBasic::build(const ColumnPtr & column)
     }
 }
 
-void StatisticsBasic::merge(const StatisticsPtr & /*other_stats*/)
+void StatisticsBasic::merge(const StatisticsPtr & other_stats)
 {
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "StatisticsBasic::merge not implemented yet");
+    const auto * other = typeid_cast<const StatisticsBasic *>(other_stats.get());
+    if (!other)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot merge StatisticsBasic with a different statistics type");
+
+    /// Numeric min/max
+    if (!other->min.isNull() && (min.isNull() || other->min < min))
+        min = other->min;
+    if (!other->max.isNull() && (max.isNull() || other->max > max))
+        max = other->max;
+
+    /// null_count: sum
+    if (other->null_count.has_value())
+    {
+        if (!null_count.has_value())
+            null_count = 0;
+        *null_count += *other->null_count;
+    }
+
+    /// String lengths: min of mins, max of maxes
+    if (other->min_length.has_value())
+    {
+        if (!min_length.has_value() || *other->min_length < *min_length)
+            min_length = *other->min_length;
+    }
+    if (other->max_length.has_value())
+    {
+        if (!max_length.has_value() || *other->max_length > *max_length)
+            max_length = *other->max_length;
+    }
 }
 
 void StatisticsBasic::serialize(WriteBuffer & /*buf*/)

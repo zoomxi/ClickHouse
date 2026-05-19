@@ -360,3 +360,24 @@ TEST(StatisticsBasic, BuildNullableString)
     EXPECT_EQ(basic.getMinLength(), 2u);
     EXPECT_EQ(basic.getMaxLength(), 3u);
 }
+
+TEST(StatisticsBasic, Merge)
+{
+    auto data_type = std::make_shared<DataTypeNullable>(std::make_shared<DataTypeInt32>());
+    SingleStatisticsDescription desc(StatisticsType::MinMax, nullptr, false);
+
+    auto a = std::make_shared<StatisticsBasic>(desc, data_type);
+    auto b = std::make_shared<StatisticsBasic>(desc, data_type);
+
+    a->setMinMax(Field(Int64(2)), Field(Int64(8)));
+    a->setNullCount(3);
+
+    b->setMinMax(Field(Int64(1)), Field(Int64(5)));
+    b->setNullCount(7);
+
+    a->merge(b);
+
+    EXPECT_EQ(a->getMin().safeGet<Int64>(), 1);
+    EXPECT_EQ(a->getMax().safeGet<Int64>(), 8);
+    EXPECT_EQ(a->getNullCount(), 10u);
+}
