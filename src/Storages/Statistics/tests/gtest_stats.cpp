@@ -4,10 +4,12 @@
 #include <Common/tests/gtest_global_register.h>
 
 #include <Columns/IColumn.h>
+#include <Columns/ColumnsNumber.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Interpreters/convertFieldToType.h>
 #include <Storages/MergeTree/RPNBuilder.h>
 #include <Storages/Statistics/Statistics.h>
+#include <Storages/Statistics/StatisticsBasic.h>
 #include <Storages/Statistics/StatisticsMinMax.h>
 #include <Storages/StatisticsDescription.h>
 #include <Storages/ColumnsDescription.h>
@@ -250,4 +252,28 @@ TEST(Statistics, LikeSelectivity)
     /// notILike function directly: 0.9 * 10000 = 9000 rows.
     UInt64 notilike_direct_rows = estimate("a not ilike '%pattern%'");
     EXPECT_EQ(notilike_direct_rows, 9000u);
+}
+
+TEST(StatisticsBasic, BuildNumeric)
+{
+    using namespace DB;
+
+    auto data_type = std::make_shared<DataTypeInt32>();
+    SingleStatisticsDescription desc(StatisticsType::MinMax, nullptr, false);
+
+    StatisticsBasic basic(desc, data_type);
+
+    auto col = ColumnInt32::create();
+    col->insert(Field(Int64(3)));
+    col->insert(Field(Int64(1)));
+    col->insert(Field(Int64(5)));
+    col->insert(Field(Int64(2)));
+
+    basic.build(std::move(col));
+
+    EXPECT_TRUE(basic.hasMinMax());
+    EXPECT_EQ(basic.getMin().safeGet<Int64>(), 1);
+    EXPECT_EQ(basic.getMax().safeGet<Int64>(), 5);
+    EXPECT_FALSE(basic.hasNullCount());
+    EXPECT_FALSE(basic.hasStringLengths());
 }

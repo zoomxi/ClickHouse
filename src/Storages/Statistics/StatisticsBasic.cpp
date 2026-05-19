@@ -2,6 +2,7 @@
 
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/IDataType.h>
 
 #include <Common/Exception.h>
 
@@ -30,9 +31,24 @@ StatisticsBasic::StatisticsBasic(Field min_, Field max_, std::optional<UInt64> n
 {
 }
 
-void StatisticsBasic::build(const ColumnPtr & /*column*/)
+void StatisticsBasic::build(const ColumnPtr & column)
 {
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "StatisticsBasic::build not implemented yet");
+    auto full_column = column->convertToFullColumnIfSparse();
+
+    /// Numeric min/max
+    if (data_type->isValueRepresentedByNumber())
+    {
+        Field min_field;
+        Field max_field;
+        full_column->getExtremes(min_field, max_field, 0, full_column->size());
+
+        if (!min_field.isNull() && (min.isNull() || min_field < min))
+            min = min_field;
+        if (!max_field.isNull() && (max.isNull() || max_field > max))
+            max = max_field;
+    }
+
+    /// null_count and string lengths are filled in Tasks 3 and 4.
 }
 
 void StatisticsBasic::merge(const StatisticsPtr & /*other_stats*/)
@@ -62,9 +78,16 @@ String StatisticsBasic::getNameForLogs() const
     return "Basic";
 }
 
-bool basicStatisticsValidator(const SingleStatisticsDescription &, const DataTypePtr &)
+bool basicStatisticsValidator(const SingleStatisticsDescription &, const DataTypePtr & data_type)
 {
-    return false;   /// will be implemented in Task 2
+    auto inner = removeLowCardinality(removeNullable(data_type));
+    if (inner->isValueRepresentedByNumber())
+        return true;
+    if (isStringOrFixedString(inner))
+        return true;
+    if (isNullableOrLowCardinalityNullable(data_type))
+        return true;
+    return false;
 }
 
 StatisticsPtr basicStatisticsCreator(const SingleStatisticsDescription & description, const DataTypePtr & data_type)
