@@ -113,6 +113,10 @@ public:
     std::shared_ptr<ColumnStatistics> cloneEmpty() const;
 
 private:
+    /// Returns the number of non-NULL rows: rows minus null_count from Basic statistics (if available).
+    /// Used internally by `estimateLess` to feed the correct denominator into `StatisticsBasic`.
+    UInt64 getNonNullRowCount() const;
+
     friend class MergeTreeStatisticsFactory;
     ColumnStatisticsDescription stats_desc;
     StatsMap stats;

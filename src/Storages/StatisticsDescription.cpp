@@ -53,10 +53,16 @@ StatisticsType stringToStatisticsType(String type)
         return StatisticsType::Uniq;
     if (type == "countmin")
         return StatisticsType::CountMinSketch;
+    if (type == "basic")
+        return StatisticsType::Basic;
     if (type == "minmax")
-        return StatisticsType::MinMax;
+        return StatisticsType::Basic; /// backward-compatible alias for 'basic'
+    if (type == "nullcount")
+        throw Exception(
+            ErrorCodes::INCORRECT_QUERY,
+            "Statistics type 'nullcount' has been removed. Use STATISTICS basic to track null counts.");
 
-    throw Exception(ErrorCodes::INCORRECT_QUERY, "Unknown statistics type: {}. Supported statistics types are 'countmin', 'minmax', 'tdigest' and 'uniq'.", type);
+    throw Exception(ErrorCodes::INCORRECT_QUERY, "Unknown statistics type: {}. Supported statistics types are 'basic', 'countmin', 'tdigest' and 'uniq'. 'minmax' is accepted as a backward-compatible alias for 'basic'.", type);
 }
 
 String statisticsTypeToString(StatisticsType type)
@@ -69,10 +75,10 @@ String statisticsTypeToString(StatisticsType type)
             return "Uniq";
         case StatisticsType::CountMinSketch:
             return "countmin";
-        case StatisticsType::MinMax:
-            return "minmax";
+        case StatisticsType::Basic:
+            return "basic";
         default:
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Unknown statistics type: {}. Supported statistics types are 'countmin', 'minmax', 'tdigest' and 'uniq'.", type);
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Unknown statistics type: {}. Supported statistics types are 'basic', 'countmin', 'tdigest' and 'uniq'.", type);
     }
 }
 

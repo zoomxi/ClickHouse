@@ -8,11 +8,15 @@
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
 #include <IO/ReadBufferFromString.h>
+#include <IO/WriteBufferFromString.h>
 #include <Interpreters/convertFieldToType.h>
+#include <DataTypes/DataTypeFactory.h>
+#include <DataTypes/DataTypeLowCardinality.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <Storages/ColumnsDescription.h>
 #include <Storages/Statistics/ConditionSelectivityEstimator.h>
+#include <Storages/Statistics/StatisticsBasic.h>
 #include <Storages/Statistics/StatisticsCountMinSketch.h>
-#include <Storages/Statistics/StatisticsMinMax.h>
 #include <Storages/Statistics/StatisticsTDigest.h>
 #include <Storages/Statistics/StatisticsUniq.h>
 #include <Storages/StatisticsDescription.h>
@@ -157,9 +161,13 @@ std::optional<Float64> ColumnStatistics::estimateLess(const Field & val) const
     if (stats.contains(StatisticsType::TDigest))
         if (auto result = stats.at(StatisticsType::TDigest)->estimateLess(val))
             return result;
-    if (stats.contains(StatisticsType::MinMax))
-        if (auto result = stats.at(StatisticsType::MinMax)->estimateLess(val))
+    if (stats.contains(StatisticsType::Basic))
+    {
+        auto & basic = assert_cast<StatisticsBasic &>(*stats.at(StatisticsType::Basic));
+        basic.setNonNullRowCount(getNonNullRowCount());
+        if (auto result = basic.estimateLess(val))
             return result;
+    }
     return std::nullopt;
 }
 
@@ -239,6 +247,27 @@ UInt64 ColumnStatistics::estimateCardinality() const
     return UInt64(static_cast<Float64>(rows) * ConditionSelectivityEstimator::default_cardinality_ratio);
 }
 
+UInt64 ColumnStatistics::getNonNullRowCount() const
+{
+    if (stats.contains(StatisticsType::Basic))
+    {
+        const auto & basic = assert_cast<const StatisticsBasic &>(*stats.at(StatisticsType::Basic));
+        if (basic.hasNullCount())
+            return rows - std::min(rows, basic.getNullCount());
+    }
+    return rows;
+}
+
+UInt64 ColumnStatistics::estimateDefaults() const
+{
+    if (stats.contains(StatisticsType::Basic))
+    {
+        const auto & basic = assert_cast<const StatisticsBasic &>(*stats.at(StatisticsType::Basic));
+        return basic.getNullCount();
+    }
+    return 0;
+}
+
 Estimate ColumnStatistics::getEstimate() const
 {
     Estimate info;
@@ -250,13 +279,13 @@ Estimate ColumnStatistics::getEstimate() const
     if (stats.contains(StatisticsType::Uniq))
         info.estimated_cardinality = stats.at(StatisticsType::Uniq)->estimateCardinality();
 
-    if (stats.contains(StatisticsType::MinMax))
+    if (stats.contains(StatisticsType::Basic))
     {
-        const auto & minmax_stats = assert_cast<const StatisticsMinMax &>(*stats.at(StatisticsType::MinMax));
-        if (!minmax_stats.getMin().isNull())
-            info.estimated_min = minmax_stats.getMin();
-        if (!minmax_stats.getMax().isNull())
-            info.estimated_max = minmax_stats.getMax();
+        const auto & basic_stats = assert_cast<const StatisticsBasic &>(*stats.at(StatisticsType::Basic));
+        if (!basic_stats.getMin().isNull())
+            info.estimated_min = basic_stats.getMin();
+        if (!basic_stats.getMax().isNull())
+            info.estimated_max = basic_stats.getMax();
     }
 
     return info;
@@ -264,20 +293,29 @@ Estimate ColumnStatistics::getEstimate() const
 
 void ColumnStatistics::serialize(WriteBuffer & buf) const
 {
-    writeIntBinary(StatisticsFileVersion::V2, buf);
+    writeIntBinary(static_cast<UInt16>(StatisticsFileVersion::V3), buf);
 
     UInt64 stat_types_mask = 0;
-    for (const auto & [type, _]: stats)
+    for (const auto & [type, _] : stats)
         stat_types_mask |= 1ULL << static_cast<UInt8>(type);
 
     writeIntBinary(stat_types_mask, buf);
 
-    /// As the column row count is always useful, save it in any case
+    /// Total row count is always useful — store it unconditionally.
     writeIntBinary(rows, buf);
 
-    /// Write the actual statistics object
+    /// V3: each stat payload is preceded by its byte size for forward compatibility
+    /// (allows readers to skip stat types added by future versions of this code).
     for (const auto & [type, stat_ptr] : stats)
-        stat_ptr->serialize(buf);
+    {
+        String temp_data;
+        {
+            WriteBufferFromString temp_buf(temp_data);
+            stat_ptr->serialize(temp_buf);
+        }
+        writeIntBinary(static_cast<UInt64>(temp_data.size()), buf);
+        buf.write(temp_data.data(), temp_data.size());
+    }
 }
 
 std::shared_ptr<ColumnStatistics> ColumnStatistics::deserialize(ReadBuffer & buf, const DataTypePtr & data_type)
@@ -286,7 +324,9 @@ std::shared_ptr<ColumnStatistics> ColumnStatistics::deserialize(ReadBuffer & buf
     readIntBinary(version_raw, buf);
     auto version = static_cast<StatisticsFileVersion>(version_raw);
 
-    if (version != StatisticsFileVersion::V1 && version != StatisticsFileVersion::V2)
+    if (version != StatisticsFileVersion::V1
+        && version != StatisticsFileVersion::V2
+        && version != StatisticsFileVersion::V3)
         throw Exception(
             ErrorCodes::ILLEGAL_STATISTICS,
             "Tried to read statistics file with unsupported format version {}. "
@@ -311,8 +351,83 @@ std::shared_ptr<ColumnStatistics> ColumnStatistics::deserialize(ReadBuffer & buf
     auto result = factory.get(stats_desc);
     readIntBinary(result->rows, buf);
 
-    for (const auto & [_, desc] : result->stats)
-        desc->deserialize(buf, version);
+    if (version == StatisticsFileVersion::V3)
+    {
+        /// V3 format: each stat payload is preceded by its byte size.
+        /// Stat types unrecognized by this binary have their bytes skipped (forward compatibility).
+        for (size_t i = 0; i < static_cast<UInt8>(StatisticsType::Max); ++i)
+        {
+            if (!(stat_types_mask & (1ULL << i)))
+                continue;
+
+            UInt64 stat_size;
+            readIntBinary(stat_size, buf);
+
+            auto stat_type = static_cast<StatisticsType>(i);
+            auto it = result->stats.find(stat_type);
+            if (it != result->stats.end())
+                it->second->deserialize(buf, version);
+            else
+                buf.ignore(stat_size); /// forward-skip: stat type unrecognized by this binary
+        }
+    }
+    else
+    {
+        /// V1/V2 legacy path: translate `StatisticsMinMax` payload → `StatisticsBasic` inline.
+        /// Other stat types (TDigest, Uniq, CountMin) use their existing V1/V2 deserialization.
+        for (const auto & [type, stat_ptr] : result->stats)
+        {
+            if (type == StatisticsType::Basic)
+            {
+                /// V1/V2 MinMax payload format:
+                ///   V1: [u64 row_count][Float64 min][Float64 max]
+                ///   V2: [u64 row_count][string type_name][Field min][Field max]
+                /// `row_count` duplicates `ColumnStatistics::rows`; discard it.
+                UInt64 legacy_row_count;
+                readIntBinary(legacy_row_count, buf);
+                (void)legacy_row_count;
+
+                auto * basic = typeid_cast<StatisticsBasic *>(stat_ptr.get());
+                if (!basic)
+                    throw Exception(
+                        ErrorCodes::LOGICAL_ERROR,
+                        "Expected StatisticsBasic for type Basic during V1/V2 legacy deserialization");
+
+                if (version == StatisticsFileVersion::V1)
+                {
+                    Float64 min_f64;
+                    Float64 max_f64;
+                    readFloatBinary(min_f64, buf);
+                    readFloatBinary(max_f64, buf);
+                    basic->setMinMax(min_f64, max_f64);
+                }
+                else /// V2
+                {
+                    String stored_type_name;
+                    readStringBinary(stored_type_name, buf);
+                    Field min_field = readFieldBinary(buf);
+                    Field max_field = readFieldBinary(buf);
+
+                    const auto inner_data_type = removeNullable(removeLowCardinality(data_type));
+                    if (stored_type_name != inner_data_type->getName())
+                    {
+                        auto stored_type = DataTypeFactory::instance().get(stored_type_name);
+                        if (!min_field.isNull())
+                            min_field = convertFieldToType(min_field, *inner_data_type, stored_type.get());
+                        if (!max_field.isNull())
+                            max_field = convertFieldToType(max_field, *inner_data_type, stored_type.get());
+                    }
+                    basic->setMinMax(std::move(min_field), std::move(max_field));
+                }
+                /// null_count stays nullopt: V1/V2 files carry no null information.
+                /// getNonNullRowCount() will return `rows`, preserving old MinMax estimation semantics.
+            }
+            else
+            {
+                stat_ptr->deserialize(buf, version);
+            }
+        }
+    }
 
     return result;
 }
@@ -397,8 +512,8 @@ void MergeTreeStatisticsFactory::registerValidator(StatisticsType stats_type, Va
 
 MergeTreeStatisticsFactory::MergeTreeStatisticsFactory()
 {
-    registerValidator(StatisticsType::MinMax, minMaxStatisticsValidator);
-    registerCreator(StatisticsType::MinMax, minMaxStatisticsCreator);
+    registerValidator(StatisticsType::Basic, basicStatisticsValidator);
+    registerCreator(StatisticsType::Basic, basicStatisticsCreator);
 
     registerValidator(StatisticsType::TDigest, tdigestStatisticsValidator);
     registerCreator(StatisticsType::TDigest, tdigestStatisticsCreator);
@@ -462,7 +577,7 @@ ColumnStatisticsPtr MergeTreeStatisticsFactory::get(const ColumnStatisticsDescri
     {
         auto it = creators.find(type);
         if (it == creators.end())
-            throw Exception(ErrorCodes::INCORRECT_QUERY, "Unknown statistic type '{}'. Available types: 'countmin', 'minmax', 'tdigest' and 'uniq'", type);
+            throw Exception(ErrorCodes::INCORRECT_QUERY, "Unknown statistic type '{}'. Available types: 'basic', 'countmin', 'tdigest' and 'uniq'", type);
 
         auto stat_ptr = (it->second)(desc, stats_desc.data_type);
         column_stat->stats[type] = stat_ptr;
@@ -478,7 +593,7 @@ ColumnStatisticsDescription::StatisticsTypeDescMap MergeTreeStatisticsFactory::g
     {
         auto it = validators.find(type);
         if (it == validators.end())
-            throw Exception(ErrorCodes::INCORRECT_QUERY, "Unknown statistic type '{}'. Available types: 'countmin', 'minmax', 'tdigest' and 'uniq'", type);
+            throw Exception(ErrorCodes::INCORRECT_QUERY, "Unknown statistic type '{}'. Available types: 'basic', 'countmin', 'tdigest' and 'uniq'", type);
 
         auto ast = make_intrusive<ASTIdentifier>(statisticsTypeToString(type));
         SingleStatisticsDescription desc(type, ast, false);

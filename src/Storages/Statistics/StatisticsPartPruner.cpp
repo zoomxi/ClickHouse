@@ -63,7 +63,7 @@ StatisticsPartPruner::StatisticsPartPruner(const StorageMetadataPtr & metadata_,
     {
         if (const auto * col = columns.tryGet(name))
         {
-            if (col->statistics.types_to_desc.contains(StatisticsType::MinMax))
+            if (col->statistics.types_to_desc.contains(StatisticsType::Basic))
             {
                 stats_column_name_to_type_map[col->name] = col->type;
                 useless = false;
@@ -105,11 +105,11 @@ KeyCondition * StatisticsPartPruner::getKeyConditionForEstimates(const NamesAndT
 
 BoolMask StatisticsPartPruner::checkPartCanMatch(const Estimates & estimates)
 {
-    /// Filter estimates with loaded MinMax statistics.
+    /// Filter estimates with loaded Basic statistics.
     Estimates minmax_estimates;
     for (const auto & [col_name, estimate] : estimates)
     {
-        if (estimate.types.contains(StatisticsType::MinMax))
+        if (estimate.types.contains(StatisticsType::Basic))
             minmax_estimates[col_name] = estimate;
     }
 
