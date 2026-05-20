@@ -1,0 +1,3 @@
+CREATE TABLE default.tab\n(\n    `col` UInt32 STATISTICS(basic)\n)\nENGINE = MergeTree\nORDER BY tuple()\nSETTINGS index_granularity = 8192
+100
+200
