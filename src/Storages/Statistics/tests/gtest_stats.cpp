@@ -12,11 +12,12 @@
 #include <DataTypes/DataTypesNumber.h>
 #include <Interpreters/convertFieldToType.h>
 #include <IO/ReadBufferFromString.h>
+#include <IO/ReadHelpers.h>
 #include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
 #include <Storages/MergeTree/RPNBuilder.h>
 #include <Storages/Statistics/Statistics.h>
 #include <Storages/Statistics/StatisticsBasic.h>
-#include <Storages/Statistics/StatisticsMinMax.h>
 #include <Storages/StatisticsDescription.h>
 #include <Storages/ColumnsDescription.h>
 #include <Storages/Statistics/StatisticsTDigest.h>
@@ -161,7 +162,8 @@ TEST(Statistics, MinMaxEstimateLess)
 {
     auto test_minmax = [](Field min_val, Field max_val, UInt64 row_count, Field val, Float64 expected)
     {
-        StatisticsMinMax stats(min_val, max_val, row_count);
+        StatisticsBasic stats(min_val, max_val, std::nullopt);
+        stats.setNonNullRowCount(row_count);
         auto result = stats.estimateLess(val);
         ASSERT_TRUE(result.has_value()) << "estimateLess returned nullopt";
         EXPECT_DOUBLE_EQ(*result, expected);
@@ -189,8 +191,9 @@ TEST(Statistics, MinMaxEstimateLess)
     const UInt64 base = (1ULL << 53); /// = 9007199254740992
     test_minmax(UInt64(base), UInt64(base + 2), 3, UInt64(base + 1), 1.5); /// (1/2)*3 = 1.5
 
-    /// estimateLess returns nullopt when row_count = 0
-    StatisticsMinMax empty(Field{}, Field{}, 0);
+    /// estimateLess returns nullopt when non_null_row_count = 0
+    StatisticsBasic empty(Field{}, Field{}, std::nullopt);
+    empty.setNonNullRowCount(0);
     EXPECT_FALSE(empty.estimateLess(Field(UInt64(42))).has_value());
 }
 
@@ -263,7 +266,7 @@ TEST(Statistics, LikeSelectivity)
 TEST(StatisticsBasic, BuildNumeric)
 {
     auto data_type = std::make_shared<DataTypeInt32>();
-    SingleStatisticsDescription desc(StatisticsType::MinMax, nullptr, false);
+    SingleStatisticsDescription desc(StatisticsType::Basic, nullptr, false);
 
     StatisticsBasic basic(desc, data_type);
 
@@ -285,7 +288,7 @@ TEST(StatisticsBasic, BuildNumeric)
 TEST(StatisticsBasic, BuildNullable)
 {
     auto data_type = std::make_shared<DataTypeNullable>(std::make_shared<DataTypeInt32>());
-    SingleStatisticsDescription desc(StatisticsType::MinMax, nullptr, false);
+    SingleStatisticsDescription desc(StatisticsType::Basic, nullptr, false);
 
     StatisticsBasic basic(desc, data_type);
 
@@ -317,7 +320,7 @@ TEST(StatisticsBasic, BuildNullable)
 TEST(StatisticsBasic, BuildString)
 {
     auto data_type = std::make_shared<DataTypeString>();
-    SingleStatisticsDescription desc(StatisticsType::MinMax, nullptr, false);
+    SingleStatisticsDescription desc(StatisticsType::Basic, nullptr, false);
 
     StatisticsBasic basic(desc, data_type);
 
@@ -339,7 +342,7 @@ TEST(StatisticsBasic, BuildString)
 TEST(StatisticsBasic, BuildNullableString)
 {
     auto data_type = std::make_shared<DataTypeNullable>(std::make_shared<DataTypeString>());
-    SingleStatisticsDescription desc(StatisticsType::MinMax, nullptr, false);
+    SingleStatisticsDescription desc(StatisticsType::Basic, nullptr, false);
 
     StatisticsBasic basic(desc, data_type);
 
@@ -366,7 +369,7 @@ TEST(StatisticsBasic, BuildNullableString)
 TEST(StatisticsBasic, Merge)
 {
     auto data_type = std::make_shared<DataTypeNullable>(std::make_shared<DataTypeInt32>());
-    SingleStatisticsDescription desc(StatisticsType::MinMax, nullptr, false);
+    SingleStatisticsDescription desc(StatisticsType::Basic, nullptr, false);
 
     auto a = std::make_shared<StatisticsBasic>(desc, data_type);
     auto b = std::make_shared<StatisticsBasic>(desc, data_type);
@@ -387,7 +390,7 @@ TEST(StatisticsBasic, Merge)
 TEST(StatisticsBasic, V3RoundTrip)
 {
     auto data_type = std::make_shared<DataTypeNullable>(std::make_shared<DataTypeString>());
-    SingleStatisticsDescription desc(StatisticsType::MinMax, nullptr, false);
+    SingleStatisticsDescription desc(StatisticsType::Basic, nullptr, false);
 
     auto orig = std::make_shared<StatisticsBasic>(desc, data_type);
     /// String column: no numeric min/max; has null_count and string lengths after build().
@@ -425,7 +428,7 @@ TEST(StatisticsBasic, V3RoundTrip)
 TEST(StatisticsBasic, V3RoundTripNumeric)
 {
     auto data_type = std::make_shared<DataTypeInt32>();
-    SingleStatisticsDescription desc(StatisticsType::MinMax, nullptr, false);
+    SingleStatisticsDescription desc(StatisticsType::Basic, nullptr, false);
 
     StatisticsBasic orig(desc, data_type);
     orig.setMinMax(Field(Int64(-3)), Field(Int64(42)));
@@ -452,7 +455,7 @@ TEST(StatisticsBasic, V3RoundTripNumeric)
 TEST(StatisticsBasic, EstimateLessNumeric)
 {
     auto data_type = std::make_shared<DataTypeInt32>();
-    SingleStatisticsDescription desc(StatisticsType::MinMax, nullptr, false);
+    SingleStatisticsDescription desc(StatisticsType::Basic, nullptr, false);
 
     StatisticsBasic basic(desc, data_type);
     basic.setMinMax(Field(Int64(0)), Field(Int64(100)));
@@ -462,4 +465,91 @@ TEST(StatisticsBasic, EstimateLessNumeric)
     ASSERT_TRUE(less_50.has_value());
     /// Linear interpolation on [0, 100] for predicate < 50 with 100 rows -> ~50 rows.
     EXPECT_NEAR(*less_50, 50.0, 0.5);
+}
+
+/// V1 format (StatisticsFileVersion::V1):
+///   [u16 version][u64 stat_types_mask][u64 rows]
+///   For Basic (mask bit 3):
+///     [u64 legacy_row_count (discarded)][Float64 min][Float64 max]
+///
+/// Verifies that `ColumnStatistics::deserialize` translates old Float64 min/max into a
+/// `StatisticsBasic` with the correct Field values and `null_count = nullopt`.
+TEST(StatisticsBasic, DeserializeLegacyV1)
+{
+    auto data_type = std::make_shared<DataTypeFloat64>();
+
+    String buf_str;
+    {
+        WriteBufferFromString out(buf_str);
+        writeIntBinary(static_cast<UInt16>(StatisticsFileVersion::V1), out);                  /// version = 1
+        writeIntBinary(static_cast<UInt64>(1ULL << static_cast<UInt8>(StatisticsType::Basic)), out); /// mask: only Basic (bit 3)
+        writeIntBinary(static_cast<UInt64>(200), out);                                        /// total rows
+        /// V1 MinMax payload: [legacy_row_count][Float64 min][Float64 max]
+        writeIntBinary(static_cast<UInt64>(200), out);                                        /// legacy_row_count (discarded)
+        writeFloatBinary(static_cast<Float64>(1.0), out);                                     /// min
+        writeFloatBinary(static_cast<Float64>(9.0), out);                                     /// max
+    }
+
+    ReadBufferFromString in(buf_str);
+    auto col_stats = ColumnStatistics::deserialize(in, data_type);
+
+    ASSERT_NE(col_stats, nullptr);
+    EXPECT_EQ(col_stats->getNumRows(), 200u);
+
+    const auto & stats_map = col_stats->getStats();
+    auto it = stats_map.find(StatisticsType::Basic);
+    ASSERT_NE(it, stats_map.end());
+
+    const auto * basic = dynamic_cast<const StatisticsBasic *>(it->second.get());
+    ASSERT_NE(basic, nullptr);
+
+    EXPECT_TRUE(basic->hasMinMax());
+    EXPECT_DOUBLE_EQ(basic->getMin().safeGet<Float64>(), 1.0);
+    EXPECT_DOUBLE_EQ(basic->getMax().safeGet<Float64>(), 9.0);
+    EXPECT_FALSE(basic->hasNullCount());        /// V1 carries no null information
+    EXPECT_FALSE(basic->hasStringLengths());
+}
+
+/// V2 format (StatisticsFileVersion::V2):
+///   [u16 version][u64 stat_types_mask][u64 rows]
+///   For Basic (mask bit 3):
+///     [u64 legacy_row_count (discarded)][string type_name][Field min][Field max]
+///
+/// Uses a Nullable(Float64) column to confirm that `null_count` stays `nullopt` after V2
+/// deserialization (V2 carried no null information either).
+TEST(StatisticsBasic, DeserializeLegacyV2Nullable)
+{
+    auto data_type = std::make_shared<DataTypeNullable>(std::make_shared<DataTypeFloat64>());
+
+    String buf_str;
+    {
+        WriteBufferFromString out(buf_str);
+        writeIntBinary(static_cast<UInt16>(StatisticsFileVersion::V2), out);                  /// version = 2
+        writeIntBinary(static_cast<UInt64>(1ULL << static_cast<UInt8>(StatisticsType::Basic)), out); /// mask: only Basic (bit 3)
+        writeIntBinary(static_cast<UInt64>(50), out);                                         /// total rows
+        /// V2 MinMax payload: [legacy_row_count][string type_name][Field min][Field max]
+        writeIntBinary(static_cast<UInt64>(50), out);                                         /// legacy_row_count (discarded)
+        writeStringBinary(String("Float64"), out);                                            /// stored inner type (same as column inner type — no conversion)
+        writeFieldBinary(Field(Float64(3.14)), out);                                          /// min
+        writeFieldBinary(Field(Float64(9.99)), out);                                          /// max
+    }
+
+    ReadBufferFromString in(buf_str);
+    auto col_stats = ColumnStatistics::deserialize(in, data_type);
+
+    ASSERT_NE(col_stats, nullptr);
+    EXPECT_EQ(col_stats->getNumRows(), 50u);
+
+    const auto & stats_map = col_stats->getStats();
+    auto it = stats_map.find(StatisticsType::Basic);
+    ASSERT_NE(it, stats_map.end());
+
+    const auto * basic = dynamic_cast<const StatisticsBasic *>(it->second.get());
+    ASSERT_NE(basic, nullptr);
+
+    EXPECT_TRUE(basic->hasMinMax());
+    EXPECT_DOUBLE_EQ(basic->getMin().safeGet<Float64>(), 3.14);
+    EXPECT_DOUBLE_EQ(basic->getMax().safeGet<Float64>(), 9.99);
+    EXPECT_FALSE(basic->hasNullCount());        /// V2 carries no null information
+    EXPECT_FALSE(basic->hasStringLengths());
 }
