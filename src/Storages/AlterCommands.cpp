@@ -2474,6 +2474,15 @@ void AlterCommands::validate(const StoragePtr & table, ContextPtr context) const
                     throw Exception(std::move(message), ErrorCodes::NOT_FOUND_COLUMN_IN_BLOCK);
                 }
             }
+            else
+            {
+                /// Mirror `apply()`: later subcommands (e.g. `MODIFY COLUMN ... REMOVE COMMENT`)
+                /// validate against the comment this command installs.
+                all_columns.modify(command.column_name, [&](ColumnDescription & column)
+                {
+                    column.comment = *command.comment;
+                });
+            }
         }
         else if (command.type == AlterCommand::RESET_SETTING)
         {
