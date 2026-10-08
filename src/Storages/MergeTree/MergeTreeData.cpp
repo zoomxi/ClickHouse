@@ -5727,8 +5727,8 @@ void MergeTreeData::checkAlterEligibility(const AlterCommands & commands, Contex
             /// CLEAR COLUMN rewrites the whole part and would drop the per-part `unique_key_index.sst`.
             /// Reject it only when it targets a stored column: `CLEAR COLUMN missing IF EXISTS` and
             /// CLEAR of a non-stored column are no-ops, and CLEAR of a UK column hits the
-            /// ALTER_OF_COLUMN_IS_FORBIDDEN guard below. This is the only chokepoint: CLEAR COLUMN is
-            /// dispatched as an AlterCommand, not a mutation.
+            /// ALTER_OF_COLUMN_IS_FORBIDDEN guard below. The mutation conversion also rejects CLEAR,
+            /// but only after applying earlier subcommands; this guard must see the same physicality.
             if (command.type == AlterCommand::DROP_COLUMN && command.clear && !command.ignore
                 && !uk_set.contains(command.column_name)
                 && (share_nested_offsets
@@ -5752,6 +5752,32 @@ void MergeTreeData::checkAlterEligibility(const AlterCommands & commands, Contex
                     && (working_columns.has(command.column_name)
                         || (share_nested_offsets && working_columns.hasNested(command.column_name))))
                     working_columns.remove(command.column_name);
+                /// Physicality can change (`ALIAS`/`EPHEMERAL` <-> stored) and a later
+                /// `CLEAR COLUMN` must see the post-`MODIFY` shape, matching `apply()`.
+                else if (command.type == AlterCommand::MODIFY_COLUMN && working_columns.has(command.column_name))
+                {
+                    working_columns.modify(command.column_name, [&](ColumnDescription & column)
+                    {
+                        if (command.isRemovingProperty())
+                        {
+                            switch (command.to_remove)
+                            {
+                                case AlterCommand::RemoveProperty::DEFAULT:
+                                case AlterCommand::RemoveProperty::MATERIALIZED:
+                                case AlterCommand::RemoveProperty::ALIAS:
+                                    column.default_desc = ColumnDefault{};
+                                    break;
+                                default:
+                                    break;
+                            }
+                        }
+                        else if (command.default_expression)
+                        {
+                            column.default_desc.kind = command.default_kind;
+                            column.default_desc.expression = command.default_expression;
+                        }
+                    });
+                }
             }
 
             const bool affects_column =
