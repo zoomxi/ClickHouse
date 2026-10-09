@@ -2452,7 +2452,29 @@ void AlterCommands::validate(const StoragePtr & table, ContextPtr context) const
                 }
                 /// `CLEAR COLUMN` / `DROP ... IN PARTITION` keep the column, as in `prepare()`.
                 if (!command.clear && !command.partition)
+                {
+                    /// A Nested parent drop removes every `n.*` member. Record staged
+                    /// defaults that are still in the snapshot, then drop those whose
+                    /// columns actually left, so `MODIFY x DEFAULT y, DROP x, DROP y`
+                    /// does not keep analyzing `y AS x_tmp_alter...`.
+                    std::vector<String> staged_in_snapshot;
+                    for (const auto & entry : installed_default_aliases)
+                    {
+                        if (all_columns.has(entry.first))
+                            staged_in_snapshot.push_back(entry.first);
+                    }
+
                     all_columns.remove(command.column_name);
+
+                    for (const auto & name : staged_in_snapshot)
+                    {
+                        if (!all_columns.has(name))
+                        {
+                            drop_staged_default(name);
+                            insert_time_default_columns.erase(name);
+                        }
+                    }
+                }
             }
             else if (!command.if_exists)
             {
