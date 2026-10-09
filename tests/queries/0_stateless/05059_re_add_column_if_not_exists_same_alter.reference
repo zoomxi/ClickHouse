@@ -108,3 +108,5 @@ modify chain snapshot	x
 modify chain default	x	
 modify chain remove then retype	x	Int8	
 add chain remove then retype	x	Int8	
+replace staged default	x	DEFAULT	1
+replace staged default add	x	DEFAULT	1

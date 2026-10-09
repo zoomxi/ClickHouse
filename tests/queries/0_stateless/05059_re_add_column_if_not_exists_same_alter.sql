@@ -478,3 +478,25 @@ ALTER TABLE modify_chain_bad_type_add
     (ADD COLUMN x String DEFAULT 'a'),
     (MODIFY COLUMN x Int8); -- { serverError CANNOT_PARSE_TEXT }
 DROP TABLE modify_chain_bad_type_add;
+
+-- Replacing a staged default must drop the earlier synthetic alias pair, so a later
+-- DROP of a dependency that only the first default needed is valid.
+DROP TABLE IF EXISTS replace_staged_default;
+CREATE TABLE replace_staged_default (x UInt8, y UInt8) ENGINE = MergeTree ORDER BY tuple();
+ALTER TABLE replace_staged_default
+    (MODIFY COLUMN x DEFAULT y),
+    (MODIFY COLUMN x DEFAULT 1),
+    (DROP COLUMN y);
+SELECT 'replace staged default', name, default_kind, default_expression FROM system.columns
+    WHERE database = currentDatabase() AND table = 'replace_staged_default' AND name = 'x';
+DROP TABLE replace_staged_default;
+
+DROP TABLE IF EXISTS replace_staged_default_add;
+CREATE TABLE replace_staged_default_add (y UInt8) ENGINE = MergeTree ORDER BY tuple();
+ALTER TABLE replace_staged_default_add
+    (ADD COLUMN x UInt8 DEFAULT y),
+    (MODIFY COLUMN x DEFAULT 1),
+    (DROP COLUMN y);
+SELECT 'replace staged default add', name, default_kind, default_expression FROM system.columns
+    WHERE database = currentDatabase() AND table = 'replace_staged_default_add' AND name = 'x';
+DROP TABLE replace_staged_default_add;

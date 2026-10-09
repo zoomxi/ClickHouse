@@ -2612,6 +2612,11 @@ void AlterCommands::validate(const StoragePtr & table, ContextPtr context) const
 
                 const auto & final_column_name = column_name;
                 const auto tmp_column_name = final_column_name + "_tmp_alter" + toString(randomSeed());
+                /// A later `DEFAULT` / `MATERIALIZED` / `ALIAS` for the same column replaces the
+                /// earlier staged pair. Without this, `MODIFY COLUMN x DEFAULT y, MODIFY COLUMN x
+                /// DEFAULT 1, DROP COLUMN y` still analyzes the leftover `y AS x_tmp_alter...` entry
+                /// and rejects a sequentially valid `ALTER`.
+                drop_staged_default(final_column_name);
                 installed_default_aliases[final_column_name] = tmp_column_name;
 
                 /// The conversion holds its own copy of the default expression rather than referring to the
