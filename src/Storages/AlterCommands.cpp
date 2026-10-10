@@ -2173,6 +2173,30 @@ void AlterCommands::validate(const StoragePtr & table, ContextPtr context) const
     bool defaults_evaluated_at_insert_time = true;
     if (const auto * mv = dynamic_cast<const StorageMaterializedView *>(table.get()))
         defaults_evaluated_at_insert_time = mv->hasInnerTable();
+    /// Stage the (converted, raw) default pair of `name` for the final validation, replacing
+    /// any pair an earlier command staged for it. `track` records the tmp alias so later
+    /// commands can drop or rename the staged pair; a default the table already had stays
+    /// untracked, so two type restatements over it still collide as before.
+    auto stage_default = [&](const String & name, const ASTPtr & expression, const DataTypePtr & data_type,
+                             ColumnDefaultKind kind, bool track)
+    {
+        const auto tmp_column_name = name + "_tmp_alter" + toString(randomSeed());
+        drop_staged_default(name);
+        if (track)
+            installed_default_aliases[name] = tmp_column_name;
+
+        /// The conversion holds its own copy of the default expression rather than referring to the
+        /// alias of the expression below, for the reason explained in `getDefaultExpressionInfoInto`:
+        /// referring to it made every error inside the default expression surface as a failure to
+        /// resolve a synthetic name the user has never seen.
+        default_expr_list->children.emplace_back(setAlias(
+            addTypeConversionToAST(expression->clone(), data_type->getName()), name));
+        default_expr_list->children.emplace_back(setAlias(expression->clone(), tmp_column_name));
+
+        if (defaults_evaluated_at_insert_time
+            && (kind == ColumnDefaultKind::Default || kind == ColumnDefaultKind::Materialized))
+            insert_time_default_columns.insert(name);
+    };
     NameSet modified_columns;
     NameSet renamed_columns;
     const CodecValidationSettings codec_validation_settings(context->getSettingsRef());
@@ -2441,27 +2465,15 @@ void AlterCommands::validate(const StoragePtr & table, ContextPtr context) const
                 /// `CLEAR COLUMN` / `DROP ... IN PARTITION` keep the column, as in `prepare()`.
                 if (!command.clear && !command.partition)
                 {
-                    /// A Nested parent drop removes every `n.*` member. Record staged
-                    /// defaults that are still in the snapshot, then drop those whose
-                    /// columns actually left, so `MODIFY x DEFAULT y, DROP x, DROP y`
-                    /// does not keep analyzing `y AS x_tmp_alter...`.
-                    std::vector<String> staged_in_snapshot;
-                    for (const auto & entry : installed_default_aliases)
+                    /// A Nested parent drop removes every `n.*` member, so discard defaults
+                    /// staged for any column in the removed range (`getNested` returns the
+                    /// column itself for an exact match).
+                    for (const auto & removed_column : all_columns.getNested(command.column_name))
                     {
-                        if (all_columns.has(entry.first))
-                            staged_in_snapshot.push_back(entry.first);
+                        drop_staged_default(removed_column.name);
+                        insert_time_default_columns.erase(removed_column.name);
                     }
-
                     all_columns.remove(command.column_name);
-
-                    for (const auto & name : staged_in_snapshot)
-                    {
-                        if (!all_columns.has(name))
-                        {
-                            drop_staged_default(name);
-                            insert_time_default_columns.erase(name);
-                        }
-                    }
                 }
             }
             else if (!command.if_exists)
@@ -2590,6 +2602,36 @@ void AlterCommands::validate(const StoragePtr & table, ContextPtr context) const
             {
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "Cannot rename column from nested struct to normal column and vice versa");
             }
+
+            /// Mirror `apply()`: rename references in the working snapshot and in staged
+            /// default entries, so validation does not resolve pre-rename names.
+            RenameColumnData rename_data{command.column_name, command.rename_to};
+            RenameColumnVisitor rename_visitor(rename_data);
+            for (const auto & column : all_columns)
+            {
+                all_columns.modify(column.name, [&](ColumnDescription & column_to_modify)
+                {
+                    if (column_to_modify.default_desc.expression)
+                        rename_visitor.visit(column_to_modify.default_desc.expression);
+                });
+            }
+            for (auto & staged_default : default_expr_list->children)
+                rename_visitor.visit(staged_default);
+
+            if (auto staged_it = installed_default_aliases.find(command.column_name);
+                staged_it != installed_default_aliases.end())
+            {
+                const auto staged_tmp_name = staged_it->second;
+                installed_default_aliases.erase(staged_it);
+                installed_default_aliases[command.rename_to] = staged_tmp_name;
+                for (auto & staged_default : default_expr_list->children)
+                {
+                    if (staged_default->tryGetAlias() == command.column_name)
+                        staged_default->setAlias(command.rename_to);
+                }
+                if (insert_time_default_columns.erase(command.column_name))
+                    insert_time_default_columns.insert(command.rename_to);
+            }
         }
         else if (command.type == AlterCommand::REMOVE_TTL && !metadata->hasAnyTableTTL())
         {
@@ -2613,35 +2655,15 @@ void AlterCommands::validate(const StoragePtr & table, ContextPtr context) const
 
             if (command.default_expression)
             {
-                DataTypePtr data_type_ptr;
                 /// If we modify default, but not type.
-                if (!command.data_type) /// it's not ADD COLUMN, because we cannot add column without type
-                    data_type_ptr = all_columns.get(column_name).type;
-                else
-                    data_type_ptr = command.data_type;
+                const DataTypePtr data_type_ptr = command.data_type
+                    ? command.data_type
+                    : all_columns.get(column_name).type; /// it's not ADD COLUMN, because we cannot add column without type
 
-                const auto & final_column_name = column_name;
-                const auto tmp_column_name = final_column_name + "_tmp_alter" + toString(randomSeed());
                 /// A later `DEFAULT` / `MATERIALIZED` / `ALIAS` for the same column replaces the
-                /// earlier staged pair. Without this, `MODIFY COLUMN x DEFAULT y, MODIFY COLUMN x
-                /// DEFAULT 1, DROP COLUMN y` still analyzes the leftover `y AS x_tmp_alter...` entry
-                /// and rejects a sequentially valid `ALTER`.
-                drop_staged_default(final_column_name);
-                installed_default_aliases[final_column_name] = tmp_column_name;
-
-                /// The conversion holds its own copy of the default expression rather than referring to the
-                /// alias of the expression below, for the reason explained in `getDefaultExpressionInfoInto`:
-                /// referring to it made every error inside the default expression surface as a failure to
-                /// resolve a synthetic name the user has never seen.
-                default_expr_list->children.emplace_back(setAlias(
-                    addTypeConversionToAST(command.default_expression->clone(), data_type_ptr->getName()),
-                    final_column_name));
-
-                default_expr_list->children.emplace_back(setAlias(command.default_expression->clone(), tmp_column_name));
-
-                if (defaults_evaluated_at_insert_time
-                    && (command.default_kind == ColumnDefaultKind::Default || command.default_kind == ColumnDefaultKind::Materialized))
-                    insert_time_default_columns.insert(final_column_name);
+                /// earlier staged pair, so `MODIFY COLUMN x DEFAULT y, MODIFY COLUMN x DEFAULT 1,
+                /// DROP COLUMN y` does not analyze the leftover `y AS x_tmp_alter...` entry.
+                stage_default(column_name, command.default_expression, data_type_ptr, command.default_kind, /* track = */ true);
             } /// if we change data type for column with default
             else if (all_columns.has(column_name) && command.data_type)
             {
@@ -2650,25 +2672,11 @@ void AlterCommands::validate(const StoragePtr & table, ContextPtr context) const
                 if (!column_in_table.default_desc.expression)
                     continue;
 
-                const auto & final_column_name = column_name;
-                const auto tmp_column_name = final_column_name + "_tmp_alter" + toString(randomSeed());
-                const auto data_type_ptr = command.data_type;
-
                 /// A default installed by an earlier command of this ALTER is re-checked against the
                 /// type it will finally have; a default the table already had keeps its entry, so two
                 /// type restatements over it still collide.
-                if (drop_staged_default(final_column_name))
-                    installed_default_aliases[final_column_name] = tmp_column_name;
-
-                default_expr_list->children.emplace_back(setAlias(
-                    addTypeConversionToAST(column_in_table.default_desc.expression->clone(), data_type_ptr->getName()),
-                    final_column_name));
-
-                default_expr_list->children.emplace_back(setAlias(column_in_table.default_desc.expression->clone(), tmp_column_name));
-
-                if (defaults_evaluated_at_insert_time
-                    && (column_in_table.default_desc.kind == ColumnDefaultKind::Default || column_in_table.default_desc.kind == ColumnDefaultKind::Materialized))
-                    insert_time_default_columns.insert(final_column_name);
+                stage_default(column_name, column_in_table.default_desc.expression, command.data_type,
+                              column_in_table.default_desc.kind, /* track = */ installed_default_aliases.contains(column_name));
             }
         }
     }

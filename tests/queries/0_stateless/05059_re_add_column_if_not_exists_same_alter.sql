@@ -500,3 +500,35 @@ ALTER TABLE replace_staged_default_add
 SELECT 'replace staged default add', name, default_kind, default_expression FROM system.columns
     WHERE database = currentDatabase() AND table = 'replace_staged_default_add' AND name = 'x';
 DROP TABLE replace_staged_default_add;
+
+-- A RENAME rewrites staged default entries too: a default staged by an earlier command keeps
+-- resolving after the column it references is renamed.
+DROP TABLE IF EXISTS rename_staged_default_ref;
+CREATE TABLE rename_staged_default_ref (x UInt8, y UInt8) ENGINE = MergeTree ORDER BY tuple();
+ALTER TABLE rename_staged_default_ref
+    (MODIFY COLUMN x DEFAULT y),
+    (RENAME COLUMN y TO z);
+SELECT 'rename staged default ref', name, default_kind, default_expression FROM system.columns
+    WHERE database = currentDatabase() AND table = 'rename_staged_default_ref' ORDER BY name;
+DROP TABLE rename_staged_default_ref;
+
+-- Renaming the staged column itself moves its staged entry to the new name.
+DROP TABLE IF EXISTS rename_staged_default_self;
+CREATE TABLE rename_staged_default_self (k UInt8) ENGINE = MergeTree ORDER BY tuple();
+ALTER TABLE rename_staged_default_self
+    (ADD COLUMN x UInt8 DEFAULT 1),
+    (RENAME COLUMN x TO z);
+SELECT 'rename staged default self', name, default_kind, default_expression FROM system.columns
+    WHERE database = currentDatabase() AND table = 'rename_staged_default_self' ORDER BY name;
+DROP TABLE rename_staged_default_self;
+
+-- A stored default the table already had follows the rename in the working snapshot as well,
+-- so a later type restatement re-checks it against the post-rename name.
+DROP TABLE IF EXISTS rename_stored_default_ref;
+CREATE TABLE rename_stored_default_ref (x UInt8 DEFAULT y, y UInt8) ENGINE = MergeTree ORDER BY tuple();
+ALTER TABLE rename_stored_default_ref
+    (RENAME COLUMN y TO z),
+    (MODIFY COLUMN x UInt16);
+SELECT 'rename stored default ref', name, type, default_expression FROM system.columns
+    WHERE database = currentDatabase() AND table = 'rename_stored_default_ref' AND name = 'x';
+DROP TABLE rename_stored_default_ref;

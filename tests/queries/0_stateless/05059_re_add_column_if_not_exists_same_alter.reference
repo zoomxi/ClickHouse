@@ -110,3 +110,8 @@ modify chain remove then retype	x	Int8
 add chain remove then retype	x	Int8	
 replace staged default	x	DEFAULT	1
 replace staged default add	x	DEFAULT	1
+rename staged default ref	x	DEFAULT	z
+rename staged default ref	z		
+rename staged default self	k		
+rename staged default self	z	DEFAULT	1
+rename stored default ref	x	UInt16	z
