@@ -626,6 +626,26 @@ std::shared_ptr<const PlainRanges> Set::getPlainRanges() const
     return plain_ranges;
 }
 
+static Columns sortSetElements(const Columns & columns)
+{
+    Block block_to_sort;
+    SortDescription sort_description;
+    for (size_t i = 0; i < columns.size(); ++i)
+    {
+        String column_name = "_" + toString(i);
+        block_to_sort.insert({columns[i], nullptr, column_name});
+        sort_description.emplace_back(column_name, 1, 1);
+    }
+
+    sortBlock(block_to_sort, sort_description);
+
+    Columns result;
+    result.reserve(columns.size());
+    for (size_t i = 0; i < columns.size(); ++i)
+        result.push_back(block_to_sort.getByPosition(i).column);
+    return result;
+}
+
 Columns Set::getSetElements() const
 {
     checkIsCreated();
@@ -634,6 +654,26 @@ Columns Set::getSetElements() const
     for (const auto & col : set_elements)
         result.push_back(col->getPtr());
     return result;
+}
+
+Columns Set::getOrderedSetElements(const Columns & columns) const
+{
+    std::lock_guard lock(ordered_set_elements_mutex);
+
+    auto same_columns = [&](const Columns & cached)
+    {
+        return cached.size() == columns.size() && std::equal(cached.begin(), cached.end(), columns.begin());
+    };
+    for (const auto & entry : ordered_set_elements_cache)
+        if (same_columns(entry.input))
+            return entry.ordered;
+
+    Columns ordered = sortSetElements(columns);
+    static constexpr size_t max_cache_entries = 8;
+    if (ordered_set_elements_cache.size() == max_cache_entries)
+        ordered_set_elements_cache.erase(ordered_set_elements_cache.begin());
+    ordered_set_elements_cache.push_back({columns, ordered});
+    return ordered;
 }
 
 ColumnPtr Set::castToKeyType(const ColumnWithTypeAndName & column, size_t key, ColumnPtr & non_member_rows) const
@@ -968,7 +1008,7 @@ static std::optional<BoolMask> checkInRangeSingleColumn(
     }
 }
 
-MergeTreeSetIndex::MergeTreeSetIndex(const Columns & set_elements, std::vector<KeyTuplePositionMapping> && indexes_mapping_)
+MergeTreeSetIndex::MergeTreeSetIndex(const Columns & set_elements, std::vector<KeyTuplePositionMapping> && indexes_mapping_, const Set * set)
     : has_all_keys(set_elements.size() == indexes_mapping_.size())
     , indexes_mapping(std::move(indexes_mapping_))
     , instance_id(getNextMergeTreeSetIndexId())
@@ -996,19 +1036,7 @@ MergeTreeSetIndex::MergeTreeSetIndex(const Columns & set_elements, std::vector<K
     for (size_t i = 0; i < tuple_size; ++i)
         ordered_set[i] = set_elements[indexes_mapping[i].tuple_index];
 
-    Block block_to_sort;
-    SortDescription sort_description;
-    for (size_t i = 0; i < tuple_size; ++i)
-    {
-        String column_name = "_" + toString(i);
-        block_to_sort.insert({ordered_set[i], nullptr, column_name});
-        sort_description.emplace_back(column_name, 1, 1);
-    }
-
-    sortBlock(block_to_sort, sort_description);
-
-    for (size_t i = 0; i < tuple_size; ++i)
-        ordered_set[i] = block_to_sort.getByPosition(i).column;
+    ordered_set = set ? set->getOrderedSetElements(ordered_set) : sortSetElements(ordered_set);
 
     /// Only fixed-width key columns keep the cached ranges buffer small and bounded: their
     /// columns hold at most one value, so reuse cannot grow them. Variable-width columns

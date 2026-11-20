@@ -14,6 +14,8 @@
 #include <Columns/ColumnNullable.h>
 #include <Common/Logger_fwd.h>
 
+#include <mutex>
+
 
 namespace DB
 {
@@ -157,6 +159,10 @@ public:
     bool hasSetElements() const { return !set_elements.empty(); }
     Columns getSetElements() const;
 
+    /// Return columns sorted lexicographically, caching by input column identity.
+    /// Cache entries retain both the input and result columns.
+    Columns getOrderedSetElements(const Columns & columns) const;
+
     /// The elements of a single-column set viewed as sorted, non-overlapping ranges, built once and
     /// shared afterwards. Deriving them costs one `Field` per element plus an O(N log N) sort, which is
     /// substantial for a large set, and every consumer of the same set derives exactly the same value —
@@ -235,6 +241,14 @@ private:
 
     mutable std::shared_ptr<const PlainRanges> plain_ranges;
     mutable OnceFlag plain_ranges_once;
+
+    struct OrderedSetElementsCacheEntry
+    {
+        Columns input;
+        Columns ordered;
+    };
+    mutable std::mutex ordered_set_elements_mutex;
+    mutable std::vector<OrderedSetElementsCacheEntry> ordered_set_elements_cache;
 
     /// Protects the keys of the set. `insertFromBlock` takes it exclusively and `execute` shares it; they
     /// run at the same time only for `StorageSet`, whose inserts can run while queries use the set.
@@ -370,7 +384,8 @@ public:
         std::vector<FunctionBasePtr> functions;
     };
 
-    MergeTreeSetIndex(const Columns & set_elements, std::vector<KeyTuplePositionMapping> && indexes_mapping_);
+    MergeTreeSetIndex(
+        const Columns & set_elements, std::vector<KeyTuplePositionMapping> && indexes_mapping_, const Set * set = nullptr);
 
     [[nodiscard]] size_t size() const { return ordered_set.at(0)->size(); }
 

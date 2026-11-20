@@ -208,3 +208,44 @@ TEST(MergeTreeSetIndex, SingleIntegerColumnBounds)
     checkSingleIntegerColumn<Int32>();
     checkSingleIntegerColumn<Int64>();
 }
+
+TEST(MergeTreeSetIndex, SharesOrderedColumnsFromSet)
+{
+    auto column = DataTypeUInt64().createColumn();
+    column->insert(3);
+    column->insert(1);
+    column->insert(2);
+    Columns columns = {std::move(column)};
+
+    Set set(SizeLimits{}, 0, false);
+    MergeTreeSetIndex first(columns, {{0, 0, {}}}, &set);
+    MergeTreeSetIndex second(columns, {{0, 0, {}}}, &set);
+
+    EXPECT_EQ(first.getOrderedSet().at(0).get(), second.getOrderedSet().at(0).get());
+    EXPECT_EQ(first.getOrderedSet().at(0)->getUInt(0), 1);
+    EXPECT_EQ(first.getOrderedSet().at(0)->getUInt(1), 2);
+    EXPECT_EQ(first.getOrderedSet().at(0)->getUInt(2), 3);
+}
+
+TEST(MergeTreeSetIndex, DoesNotShareOrderedColumnsForDifferentInputsOrSets)
+{
+    auto make_column = []
+    {
+        auto column = DataTypeUInt64().createColumn();
+        column->insert(2);
+        column->insert(1);
+        return Columns{std::move(column)};
+    };
+
+    Set first_set(SizeLimits{}, 0, false);
+    Set second_set(SizeLimits{}, 0, false);
+    Columns first_columns = make_column();
+    Columns second_columns = make_column();
+
+    MergeTreeSetIndex first(first_columns, {{0, 0, {}}}, &first_set);
+    MergeTreeSetIndex different_columns(second_columns, {{0, 0, {}}}, &first_set);
+    MergeTreeSetIndex different_set(first_columns, {{0, 0, {}}}, &second_set);
+
+    EXPECT_NE(first.getOrderedSet().at(0).get(), different_columns.getOrderedSet().at(0).get());
+    EXPECT_NE(first.getOrderedSet().at(0).get(), different_set.getOrderedSet().at(0).get());
+}
