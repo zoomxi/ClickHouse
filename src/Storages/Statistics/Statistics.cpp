@@ -159,6 +159,14 @@ bool StatisticsUtils::isBoundOfType(const Field & bound, const IDataType & data_
     return actual == expected || (is_integer(actual) && is_integer(expected));
 }
 
+Field StatisticsUtils::getColumnDefaultField(const DataTypePtr & data_type)
+{
+    auto inner = removeLowCardinalityAndNullable(removeNullable(data_type));
+    auto default_col = inner->createColumn();
+    default_col->insertDefault();
+    return (*default_col)[0];
+}
+
 std::optional<Float64> StatisticsUtils::tryConvertToFloat64(const Field & value, const DataTypePtr & data_type)
 {
     if (!data_type->isValueRepresentedByNumber())

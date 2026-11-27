@@ -1,7 +1,9 @@
 #include <Columns/ColumnConst.h>
+#include <Common/VectorWithMemoryTracking.h>
 #include <Core/Field.h>
 #include <Core/NamesAndTypes.h>
 #include <DataTypes/DataTypeLowCardinality.h>
+#include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/IDataType.h>
 #include <Functions/IFunction.h>
 #include <Interpreters/ExpressionActions.h>
@@ -9,7 +11,6 @@
 #include <Storages/Statistics/StatisticsPartPruner.h>
 #include <Storages/StorageInMemoryMetadata.h>
 
-#include <map>
 #include <unordered_set>
 
 namespace DB
@@ -18,24 +19,38 @@ namespace DB
 namespace
 {
 
-/// Create a Range from statistics estimate for use in part pruning.
-/// MinMax statistics now store typed Field values, so we can directly construct Range
-/// without lossy Float64 conversions.
-///
-/// NULL handling: a Nullable column's NULL values sort at POSITIVE_INFINITY. When the NULL
-/// count is known (`Basic` statistics on a nullable column), the range can be tightened:
-///   - null_count == 0: no NULLs in the part, the right bound is the real max;
-///   - null_count == rows_count: the part is all-NULL, represented by the [+inf, +inf] sentinel
-///     range (it intersects nothing except ranges that reach the NULL sentinel);
-///   - otherwise the right bound stays POSITIVE_INFINITY to cover possible NULLs.
-///
-/// Returns std::nullopt when statistics are unavailable or corrupted,
-/// causing the caller to fall back to a whole-universe Range (no pruning).
-std::optional<Range> createRangeFromEstimate(const Estimate & estimate, bool is_nullable)
+/// Whether every non-default value of `type` compares strictly greater than its column-level default.
+bool isDefaultMinimumValue(const DataTypePtr & type)
+{
+    const WhichDataType which(removeLowCardinality(type));
+    return which.isStringOrFixedString() || which.isUUID() || which.isIPv6()
+        || which.isArray() || which.isMap();
+}
+
+/// Create a Range from a column's statistics estimate for part pruning.
+/// Returns std::nullopt when statistics are unavailable or corrupted (whole-universe fallback).
+std::optional<Range> createRangeFromEstimate(
+    const Estimate & estimate,
+    const DataTypePtr & col_type,
+    const Field & default_field,
+    bool default_is_minimum,
+    bool is_size_subcolumn)
 {
     if (estimate.rows_count == 0)
         return std::nullopt;
 
+    if (is_size_subcolumn)
+    {
+        if (!estimate.estimated_default_count.has_value() || *estimate.estimated_default_count > estimate.rows_count)
+            return std::nullopt;
+        if (*estimate.estimated_default_count == estimate.rows_count)
+            return Range(default_field, true, default_field, true);
+        if (*estimate.estimated_default_count == 0)
+            return Range::createLeftBounded(default_field, /*left_included=*/ false);
+        return std::nullopt;
+    }
+
+    const bool is_nullable = isNullableOrLowCardinalityNullable(col_type);
     const std::optional<UInt64> & null_count = estimate.estimated_null_count;
     if (null_count.has_value() && *null_count > estimate.rows_count)
         return std::nullopt;
@@ -61,10 +76,18 @@ std::optional<Range> createRangeFromEstimate(const Estimate & estimate, bool is_
         return Range(min_value, true, POSITIVE_INFINITY, true);
     }
 
-    /// No min/max (non-numeric type like String/Array/Tuple/Map): a known-zero NULL count
-    /// still excludes the NULL sentinel.
     if (is_nullable && no_nulls)
         return Range::createWholeUniverseWithoutNull();
+
+    if (!is_nullable && !default_field.isNull()
+        && estimate.estimated_default_count.has_value()
+        && *estimate.estimated_default_count <= estimate.rows_count)
+    {
+        if (*estimate.estimated_default_count == estimate.rows_count)
+            return Range(default_field, true, default_field, true);
+        if (*estimate.estimated_default_count == 0 && default_is_minimum)
+            return Range::createLeftBounded(default_field, /*left_included=*/ false);
+    }
 
     return std::nullopt;
 }
@@ -81,6 +104,45 @@ bool statisticsHasMinMaxForPartPruning(const ColumnStatisticsDescription & stats
     if (stats_desc.types_to_desc.contains(StatisticsType::Basic))
         return removeLowCardinalityAndNullable(stats_desc.data_type)->isValueRepresentedByNumber();
     return false;
+}
+
+/// Returns true if `col` is a non-Nullable column with `Basic` statistics whose `default_count`
+/// can be mapped to a comparable non-NULL column-level default `Field`.
+bool canUseDefaultCountForPartPruning(const ColumnDescription & col, Field & out_default_field)
+{
+    if (!col.statistics.types_to_desc.contains(StatisticsType::Basic))
+        return false;
+    if (isNullableOrLowCardinalityNullable(col.type))
+        return false;
+    const auto inner = removeLowCardinality(col.type);
+    if (!inner->isComparable() || isObject(inner))
+        return false;
+    out_default_field = StatisticsUtils::getColumnDefaultField(col.type);
+    return !out_default_field.isNull();
+}
+
+/// Parent of virtual `<col>.size` (non-Nullable `String`) or `<col>.size0` (`Array`/`Map`).
+/// A physical column with that name wins.
+std::optional<String> tryResolveSizeSubcolumnParent(const ColumnsDescription & columns, const String & name)
+{
+    if (columns.tryGet(name))
+        return std::nullopt;
+
+    if (name.ends_with(".size"))
+    {
+        String parent = name.substr(0, name.size() - 5);
+        const auto * parent_col = columns.tryGet(parent);
+        if (parent_col && isString(parent_col->type))
+            return parent;
+    }
+    else if (name.ends_with(".size0"))
+    {
+        String parent = name.substr(0, name.size() - 6);
+        const auto * parent_col = columns.tryGet(parent);
+        if (parent_col && (isArray(parent_col->type) || isMap(parent_col->type)))
+            return parent;
+    }
+    return std::nullopt;
 }
 
 /// If `name` is the virtual `<parent>.null` null-map (from `IS NULL` rewritten by
@@ -114,6 +176,22 @@ bool rejectsNullCountWitness(const KeyCondition & key_condition, const DataTypeP
     const bool no_null_possible = key_condition.checkInHyperrectangle(
         Hyperrectangle(1, Range::createWholeUniverseWithoutNull()), types).can_be_true;
     return !all_null_possible || !no_null_possible;
+}
+
+bool rejectsDefaultCountWitness(
+    const KeyCondition & key_condition, const DataTypePtr & type, const Field & default_field, bool default_is_minimum)
+{
+    const DataTypes types{type};
+    if (!key_condition.checkInHyperrectangle(
+            Hyperrectangle(1, Range(default_field, true, default_field, true)), types).can_be_true)
+        return true;
+
+    if (default_is_minimum
+        && !key_condition.checkInHyperrectangle(
+            Hyperrectangle(1, Range::createLeftBounded(default_field, /*left_included=*/ false)), types).can_be_true)
+        return true;
+
+    return false;
 }
 
 bool isConstantZero(const ActionsDAG::Node & node)
@@ -277,7 +355,8 @@ StatisticsPartPruner::StatisticsPartPruner(const StorageMetadataPtr & metadata_,
         collectFloatColumnsUnderNegation(filter_node_, /*under_negation=*/ false, nan_unsafe_columns, visited_under_negation, visited);
     }
 
-    std::map<String, DataTypePtr> nullable_only_columns;
+    MapWithMemoryTracking<String, DataTypePtr> nullable_only_columns;
+    MapWithMemoryTracking<String, ColumnInfo> default_only_columns;
 
     for (const auto & name : filter_columns)
     {
@@ -288,12 +367,36 @@ StatisticsPartPruner::StatisticsPartPruner(const StorageMetadataPtr & metadata_,
         {
             if (statisticsHasMinMaxForPartPruning(col->statistics))
             {
-                stats_column_name_to_type_map[col->name] = col->type;
+                Field default_field;
+                canUseDefaultCountForPartPruning(*col, default_field);
+                stats_columns.emplace(
+                    col->name,
+                    ColumnInfo{col->type, col->name, std::move(default_field), isDefaultMinimumValue(col->type), /*is_size_subcolumn=*/ false});
                 useless = false;
             }
             else if (hasBasicStatsOnNullableType(*col))
             {
                 nullable_only_columns[col->name] = col->type;
+            }
+            else
+            {
+                Field default_field;
+                if (canUseDefaultCountForPartPruning(*col, default_field))
+                {
+                    default_only_columns.emplace(
+                        col->name,
+                        ColumnInfo{col->type, col->name, std::move(default_field), isDefaultMinimumValue(col->type), /*is_size_subcolumn=*/ false});
+                }
+            }
+        }
+        else if (auto parent = tryResolveSizeSubcolumnParent(columns, name))
+        {
+            const auto * parent_col = columns.tryGet(*parent);
+            if (parent_col && parent_col->statistics.types_to_desc.contains(StatisticsType::Basic))
+            {
+                default_only_columns.emplace(
+                    name,
+                    ColumnInfo{std::make_shared<DataTypeUInt64>(), *parent, Field(UInt64(0)), /*default_is_minimum=*/ true, /*is_size_subcolumn=*/ true});
             }
         }
     }
@@ -320,8 +423,23 @@ StatisticsPartPruner::StatisticsPartPruner(const StorageMetadataPtr & metadata_,
         if (!key_condition || !rejectsNullCountWitness(*key_condition, col_type))
             continue;
 
-        stats_column_name_to_type_map[col_name] = col_type;
+        stats_columns.emplace(col_name, ColumnInfo{col_type, col_name, Field{}, false, false});
         used_column_names.insert(col_name);
+        useless = false;
+    }
+
+    /// Keep a default-count-only column or virtual size subcolumn only when it can exclude
+    /// all-default or zero-default parts by itself.
+    for (auto & [col_name, info] : default_only_columns)
+    {
+        NamesAndTypesList one_col;
+        one_col.emplace_back(col_name, info.type);
+        KeyCondition * key_condition = getKeyConditionForEstimates(one_col, /*record_used_columns=*/ false);
+        if (!key_condition || !rejectsDefaultCountWitness(*key_condition, info.type, info.default_field, info.default_is_minimum))
+            continue;
+
+        used_column_names.insert(info.estimate_column_name);
+        stats_columns.emplace(col_name, std::move(info));
         useless = false;
     }
 }
@@ -329,8 +447,8 @@ StatisticsPartPruner::StatisticsPartPruner(const StorageMetadataPtr & metadata_,
 NameSet StatisticsPartPruner::getRequiredColumns() const
 {
     NameSet result;
-    for (const auto & [col_name, _] : stats_column_name_to_type_map)
-        result.insert(col_name);
+    for (const auto & [_, info] : stats_columns)
+        result.insert(info.estimate_column_name);
     for (const auto & [col_name, _] : null_predicates)
         result.insert(col_name);
     return result;
@@ -372,7 +490,10 @@ KeyCondition * StatisticsPartPruner::getKeyConditionForEstimates(const NamesAndT
         for (size_t col_idx : key_condition_ptr->getUsedColumns())
         {
             if (col_idx < column_names.size())
-                used_column_names.insert(column_names[col_idx]);
+            {
+                auto col_it = stats_columns.find(column_names[col_idx]);
+                used_column_names.insert(col_it != stats_columns.end() ? col_it->second.estimate_column_name : column_names[col_idx]);
+            }
         }
     }
 
@@ -398,12 +519,16 @@ BoolMask StatisticsPartPruner::checkPartCanMatch(const Estimates & estimates)
             return {false, true};
     }
 
-    /// Use only columns that are both in filter and have estimates
+    /// Use only columns that are both in filter and have estimates.
     NamesAndTypesList columns;
-    for (const auto & [col_name, col_type] : stats_column_name_to_type_map)
+    VectorWithMemoryTracking<const ColumnInfo *> column_infos;
+    for (const auto & [col_name, info] : stats_columns)
     {
-        if (estimates.contains(col_name))
-            columns.emplace_back(col_name, col_type);
+        if (estimates.contains(info.estimate_column_name))
+        {
+            columns.emplace_back(col_name, info.type);
+            column_infos.push_back(&info);
+        }
     }
 
     if (columns.empty())
@@ -415,21 +540,56 @@ BoolMask StatisticsPartPruner::checkPartCanMatch(const Estimates & estimates)
 
     Hyperrectangle hyperrectangle;
     DataTypes types;
+    /// `default_count == 0` and `default` strictly inside `[min, max]`: rows lie in `[min, default)` or `(default, max]`.
+    VectorWithMemoryTracking<std::pair<size_t, const Field *>> split_points;
 
-    for (const auto & [col_name, col_type] : columns)
+    for (size_t i = 0; i < column_infos.size(); ++i)
     {
-        auto range = createRangeFromEstimate(estimates.at(col_name), isNullableOrLowCardinalityNullable(col_type));
+        const ColumnInfo & info = *column_infos[i];
+        const Estimate & estimate = estimates.at(info.estimate_column_name);
+        auto range = createRangeFromEstimate(estimate, info.type, info.default_field, info.default_is_minimum, info.is_size_subcolumn);
 
         if (range.has_value())
             hyperrectangle.push_back(std::move(*range));
-        else if (isNullableOrLowCardinalityNullable(col_type))
+        else if (isNullableOrLowCardinalityNullable(info.type))
             hyperrectangle.emplace_back(Range::createWholeUniverse());
         else
             hyperrectangle.emplace_back(Range::createWholeUniverseWithoutNull());
-        types.push_back(col_type);
+        types.push_back(info.type);
+
+        /// `-0.0` is not a default (`isDefaultAt` compares bits) but equals `0` in SQL, so floats are not split.
+        if (!info.is_size_subcolumn
+            && !info.default_field.isNull()
+            && !isFloat(removeLowCardinality(info.type))
+            && estimate.rows_count > 0
+            && estimate.estimated_default_count.has_value()
+            && *estimate.estimated_default_count == 0
+            && hyperrectangle.back().fullBounded()
+            && Range::less(hyperrectangle.back().left, info.default_field)
+            && Range::less(info.default_field, hyperrectangle.back().right))
+        {
+            split_points.emplace_back(i, &info.default_field);
+        }
     }
 
-    return key_condition->checkInHyperrectangle(hyperrectangle, types);
+    BoolMask res = key_condition->checkInHyperrectangle(hyperrectangle, types);
+    if (!res.can_be_true || split_points.empty())
+        return res;
+
+    for (const auto & [col_idx, default_field] : split_points)
+    {
+        const Range original = hyperrectangle[col_idx];
+        hyperrectangle[col_idx] = Range(original.left, original.left_included, *default_field, false);
+        if (!key_condition->checkInHyperrectangle(hyperrectangle, types).can_be_true)
+        {
+            hyperrectangle[col_idx] = Range(*default_field, false, original.right, original.right_included);
+            if (!key_condition->checkInHyperrectangle(hyperrectangle, types).can_be_true)
+                return {false, true};
+        }
+        hyperrectangle[col_idx] = original;
+    }
+
+    return res;
 }
 
 }

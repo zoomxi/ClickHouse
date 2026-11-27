@@ -91,6 +91,9 @@ struct StatisticsUtils
     /// is the one of the values of `data_type`. The bounds read from the `Field` encoding of `V2` - `V4` may have
     /// another type: e.g. the `Float64` bounds of `V1`, which older versions rewrote unchanged in `V4`.
     static bool isBoundOfType(const Field & bound, const IDataType & data_type);
+
+    /// Value inserted by `IColumn::insertDefault` (what `isDefaultAt` counts). It can differ from `IDataType::getDefault`.
+    static Field getColumnDefaultField(const DataTypePtr & data_type);
 };
 
 class IStatistics;

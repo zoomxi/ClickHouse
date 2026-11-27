@@ -52,22 +52,19 @@ SELECT explain FROM (EXPLAIN indexes = 1 SELECT count() FROM test_stats_pruning 
 SELECT count() FROM test_stats_pruning WHERE id < 50 OR version > 3050;
 
 -- =============================================================================
--- Test 3: AND with column without statistics (str (String) has only basic, which does not drive range pruning), should prune parts
+-- Test 3: AND with String column having basic statistics (default_count pruning), should prune parts
 -- =============================================================================
 -- Query: value = 50 AND str = 'a'
--- Expected: Only Part 1 matches (value=50 exists in Part 1)
--- Statistics on 'value' can still prune parts even though 'str' has no statistics
-SELECT '-- AND with column without statistics (str (String) has only basic, which does not drive range pruning), should prune parts';
+-- Expected: Only Part 1 matches (value=50 exists in Part 1); both `value` (min/max) and `str` (default_count) are statistics keys
+SELECT '-- AND with String column having basic statistics (default_count pruning), should prune parts';
 SELECT explain FROM (EXPLAIN indexes = 1 SELECT count() FROM test_stats_pruning WHERE value = 50 AND str = 'a' SETTINGS enable_parallel_replicas = 0);
 SELECT count() FROM test_stats_pruning WHERE value = 50 AND str = 'a';
 
 -- =============================================================================
--- Test 4: OR with column without statistics (str (String) has only basic, which does not drive range pruning), should NOT prune parts
+-- Test 4: OR with `str = 'x'` does not prune these parts
 -- =============================================================================
--- Query: value = 50 OR str = 'x'
--- Expected: Cannot prune any parts because OR requires all branches to be safe
--- Statistics pruning should not reduce parts (4/4 remain)
-SELECT '-- OR with column without statistics (str (String) has only basic, which does not drive range pruning), should NOT prune parts';
+-- `str = 'x'` still matches a non-empty string, so the OR cannot drop a part on `str` alone.
+SELECT '-- OR with str = x does not prune parts';
 SELECT explain FROM (EXPLAIN indexes = 1 SELECT count() FROM test_stats_pruning WHERE value = 50 OR str = 'x' SETTINGS enable_parallel_replicas = 0);
 SELECT count() FROM test_stats_pruning WHERE value = 50 OR str = 'x';
 

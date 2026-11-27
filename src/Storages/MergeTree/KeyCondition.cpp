@@ -5580,24 +5580,31 @@ void KeyCondition::extractAtomsFromFunction(const RPNBuilderTreeNode & node, con
         return;
     }
 
-    /// `empty(s)` and `notEmpty(s)` of a string are the same as `s = ''` and `s != ''`
-    /// (`ConvertEmptyStringComparisonToFunctionPass` rewrites the latter to the former).
-    /// Analyze them as these comparisons, so that keys computed from the string, like `cityHash64(s)`, are used as well.
+    /// `empty(x)` / `notEmpty(x)` are `x = default` / `x != default` for the types in `EmptyImpl`.
+    /// Analyze them as comparisons so key indexes and statistics pruning see the same predicate.
     if (num_args == 1 && (func_name == "empty" || func_name == "notEmpty"))
     {
         const auto * arg_dag_node = func.getArgumentAt(0).getDAGNode();
-        if (arg_dag_node && isString(removeNullable(removeLowCardinality(arg_dag_node->result_type))))
+        if (arg_dag_node)
         {
-            const auto string_type = std::make_shared<DataTypeString>();
-            const ColumnWithTypeAndName empty_string{string_type->createColumnConst(1, Field(String())), string_type, {}};
-            extractComparisonAtomsForKeyArgument(
-                func.getArgumentAt(0),
-                info,
-                func_name == "empty" ? "equals" : "notEquals",
-                empty_string,
-                allow_relaxed_pruning,
-                group);
-            return;
+            const auto inner_type = removeNullable(removeLowCardinality(arg_dag_node->result_type));
+            const WhichDataType which(inner_type);
+            if ((which.isStringOrFixedString() || which.isUUID() || which.isIPv4() || which.isIPv6()
+                 || which.isArray() || which.isMap())
+                && inner_type->isComparable())
+            {
+                auto default_col = inner_type->createColumn();
+                default_col->insertDefault();
+                const ColumnWithTypeAndName default_const{ColumnConst::create(std::move(default_col), 1), inner_type, {}};
+                extractComparisonAtomsForKeyArgument(
+                    func.getArgumentAt(0),
+                    info,
+                    func_name == "empty" ? "equals" : "notEquals",
+                    default_const,
+                    allow_relaxed_pruning,
+                    group);
+                return;
+            }
         }
     }
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <Common/MapWithMemoryTracking.h>
+#include <Core/Field.h>
 #include <Core/Names.h>
 #include <Storages/MergeTree/KeyCondition.h>
 #include <Storages/Statistics/Statistics.h>
@@ -7,11 +9,8 @@
 namespace DB
 {
 
-/// Part pruner based on column statistics (min/max and NULL count from `Basic` statistics,
-/// plus the deprecated `MinMax` statistics).
-/// Similar to PartitionPruner but uses per-column statistics instead of partition keys.
-/// When usable statistics are available for columns used in the filter condition,
-/// this pruner can skip entire parts where the column ranges don't overlap with the query condition.
+/// Skips parts whose `basic` (or deprecated `minmax`) column statistics cannot match the filter.
+/// Uses min/max, NULL count, and the count of rows equal to the column default.
 class StatisticsPartPruner
 {
 public:
@@ -23,7 +22,7 @@ public:
     ///   - can_be_false: whether any rows in the part might not satisfy the condition
     BoolMask checkPartCanMatch(const Estimates & estimates);
 
-    /// Returns true if no columns with MinMax statistics are used in the filter, then all parts will match.
+    /// Returns true if no columns with usable statistics are used in the filter, then all parts will match.
     [[nodiscard]] bool isUseless() const { return useless; }
 
     /// Get the list of column names used in the filter condition that have statistics.
@@ -33,6 +32,17 @@ public:
     [[nodiscard]] NameSet getRequiredColumns() const;
 
 private:
+    struct ColumnInfo
+    {
+        DataTypePtr type;
+        /// Column stored in `Estimates`. For `s.size` / `arr.size0` this is the parent column.
+        String estimate_column_name;
+        /// `IColumn::insertDefault` for a non-Nullable column with `basic` statistics. `NULL` when unused.
+        Field default_field;
+        bool default_is_minimum = false;
+        bool is_size_subcolumn = false;
+    };
+
     /// Get or create a KeyCondition for the given columns, using cache to avoid recreating for each part.
     KeyCondition * getKeyConditionForEstimates(const NamesAndTypesList & columns_and_types, bool record_used_columns = true);
 
@@ -43,7 +53,7 @@ private:
 
     const ActionsDAGWithInversionPushDown filter_dag;
     const ContextPtr context;
-    std::map<String, DataTypePtr> stats_column_name_to_type_map;
+    MapWithMemoryTracking<String, ColumnInfo> stats_columns;
     NameOrderedSet used_column_names;
     bool useless = true;
 };

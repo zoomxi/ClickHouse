@@ -1,0 +1,107 @@
+String size subcolumn
+1	1
+1003
+1	1
+2330
+String comparisons and empty
+1	1
+1003
+1	1
+2330
+1	1
+1003
+1	1
+2330
+String non-empty predicates prune the all-default part
+1	1
+100
+1	1
+300
+String predicates that cannot prune do not read statistics
+1
+1
+1
+1
+String pruning disabled
+1
+String single_stream
+1	1
+3
+1	1
+30
+LowCardinality(String)
+1	1
+103
+1	1
+230
+1	1
+10
+1
+FixedString(4)
+1	1
+103
+1	1
+230
+1	1
+10
+Array
+1	1
+103
+1	1
+230
+1	1
+103
+1	1
+10
+Map
+1	1
+103
+1	1
+230
+UUID and IPv6
+1	1
+103
+1	1
+230
+1	1
+103
+1	1
+230
+Tuple
+1	1
+20
+1
+103
+Signed Int64 split-range
+1	1
+203
+1	1
+530
+Decimal64(2) split-range
+1	1
+203
+Date32
+1	1
+203
+1	1
+110
+Enum8
+1	1
+203
+113
+200
+Float64 -0 and NaN
+232
+505
+Nullable(String)
+30
+30
+100
+203
+DDL DEFAULT
+3
+3
+30
+Literal size column names
+3
+30

@@ -157,11 +157,8 @@ StatisticsBasic::StatisticsBasic(const SingleStatisticsDescription & description
     tracks_numeric = canStatisticsTrackMinMax(data_type);
     tracks_string = isStringOrFixedString(data_type);
 
-    /// Compute the column-level default once so `estimateEqual` can compare against the same
-    /// value that `build` counts via `IColumn::isDefaultAt`.
-    auto default_col = data_type->createColumn();
-    default_col->insertDefault();
-    column_default_field = (*default_col)[0];
+    /// Same value `build` counts with `IColumn::isDefaultAt`.
+    column_default_field = StatisticsUtils::getColumnDefaultField(data_type);
 
     is_nullable = isNullableOrLowCardinalityNullable(data_type_) || column_default_field.isNull();
 
