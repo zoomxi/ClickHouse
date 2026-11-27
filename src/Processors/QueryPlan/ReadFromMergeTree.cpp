@@ -91,6 +91,7 @@
 #include <Storages/MergeTree/RangesInDataPart.h>
 #include <Storages/MergeTree/RequestResponse.h>
 #include <Storages/Statistics/ConditionSelectivityEstimator.h>
+#include <Storages/getEffectiveRowPolicyFilter.h>
 #include <Storages/StorageSnapshot.h>
 #include <Storages/VirtualColumnUtils.h>
 #include <Common/CurrentThread.h>
@@ -410,6 +411,7 @@ namespace Setting
     extern const SettingsBool use_indexes_refiner_in_read_pools;
     extern const SettingsUInt64 join_runtime_filter_exact_values_limit;
     extern const SettingsBool use_skip_indexes_for_top_k;
+    extern const SettingsBool use_statistics_for_part_pruning;
     extern const SettingsBool use_top_k_dynamic_filtering;
     extern const SettingsBool use_query_condition_cache;
     extern const SettingsBool use_query_condition_cache_for_top_k;
@@ -4243,6 +4245,13 @@ ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
         return std::make_shared<AnalysisResult>(std::move(result));
     }
 
+    if (!skip_ranges_analysis && !is_parallel_reading_from_replicas_ && !context_->canUseParallelReplicasOnFollower())
+    {
+        res_parts = MergeTreeDataSelectExecutor::filterPartsByTopKStatistics(
+            res_parts, metadata_snapshot, query_info_, mutations_snapshot, top_k_filter_info, result.sampling,
+            settings[Setting::min_marks_per_part_to_load_statistics], context_, log, result.index_stats);
+    }
+
     for (const auto & part : res_parts)
         total_marks_pk += part.data_part->index_granularity->getMarksCountWithoutFinal();
     parts_before_pk = res_parts.size();
@@ -6443,6 +6452,32 @@ void ReadFromMergeTree::initializePipeline(QueryPipelineBuilder & pipeline, [[ma
         }
     }
 
+    std::optional<String> top_k_stats_column;
+    if (top_k_filter_info && top_k_filter_info->threshold_tracker
+        && result.parts_with_ranges.size() > 1
+        && context->getSettingsRef()[Setting::use_skip_indexes_on_data_read]
+        && MergeTreeDataSelectExecutor::canUseStatisticsForPartPruning(data, query_info, mutations_snapshot, context)
+        && !MergeTreeDataSelectExecutor::hasPendingAlterOrMetadataMutations(result.parts_with_ranges, mutations_snapshot)
+        && !isParallelReadingFromReplicas()
+        && indexes.has_value()
+        && MergeTreeDataSelectExecutor::isColumnEligibleForTopKStatistics(storage_snapshot->metadata, *top_k_filter_info))
+    {
+        top_k_stats_column = top_k_filter_info->column_name;
+        if (result.read_type == ReadType::Default
+            && !query_info.isStream()
+            && !output_each_partition_through_separate_port
+            && result.split_parts.layers.empty()
+            && !query_info.input_order_info)
+        {
+            MergeTreeDataSelectExecutor::orderPartsByTopKStatistics(
+                result.parts_with_ranges,
+                storage_snapshot->metadata,
+                *top_k_filter_info,
+                context->getSettingsRef()[Setting::min_marks_per_part_to_load_statistics],
+                context);
+        }
+    }
+
     /// Use a callback to isolate MergeTreeReader from JoinRuntimeFilter. The global row index descriptors get a predicate
     /// of their own (see `MergeTreeSkipIndexReader::read`).
     MergeTreeSkipIndexReader::DynamicPredicateBuilder dynamic_predicate_builder;
@@ -6543,8 +6578,8 @@ void ReadFromMergeTree::initializePipeline(QueryPipelineBuilder & pipeline, [[ma
             getLogger("MergeTreeSkipIndexReader"));
     }
 
-    /// Need a reader for the top-K primary key pruning as well; it has nothing to prune up front.
-    if (!skip_index_reader && top_k_primary_key_column_position)
+    /// Need a reader for top-K primary key or part-statistics pruning as well; it has nothing to prune up front.
+    if (!skip_index_reader && (top_k_primary_key_column_position || top_k_stats_column))
     {
         skip_index_reader = std::make_shared<MergeTreeSkipIndexReader>(
             UsefulSkipIndexes{},
@@ -6567,6 +6602,9 @@ void ReadFromMergeTree::initializePipeline(QueryPipelineBuilder & pipeline, [[ma
 
     if (skip_index_reader && top_k_primary_key_column_position)
         skip_index_reader->setTopKPrimaryKeyPruning(*top_k_primary_key_column_position, top_k_filter_info->threshold_tracker);
+
+    if (skip_index_reader && top_k_stats_column)
+        skip_index_reader->setTopKStatisticsPruning(*top_k_stats_column, top_k_filter_info->threshold_tracker);
 
     /// Account SelectedRanges / SelectedMarks here, once all reader-creation paths above have
     /// run. When a read-time skip-index reader is installed (the use_skip_indexes_on_data_read

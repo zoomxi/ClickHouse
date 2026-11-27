@@ -59,6 +59,7 @@
 #include <DataTypes/DataTypeDate.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypesNumber.h>
+#include <DataTypes/hasNullable.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionsLogical.h>
 #include <Functions/IFunctionAdaptors.h>
@@ -1028,6 +1029,23 @@ std::expected<void, PreformattedMessage> MergeTreeDataSelectExecutor::canUseInde
 }
 
 
+bool MergeTreeDataSelectExecutor::canUseStatisticsForPartPruning(
+    const MergeTreeData & storage,
+    const SelectQueryInfo & query_info,
+    const MergeTreeData::MutationsSnapshotPtr & mutations_snapshot,
+    const ContextPtr & context)
+{
+    /// Statistics describe rows as written. A row policy is included because reporting `read_rows`
+    /// after pruning would reveal rows the policy hides. Pending `ALTER` / `DROP` / `RENAME` are
+    /// checked per part by the caller (`partHasPendingAlterOrMetadataMutations`).
+    return context->getSettingsRef()[Setting::use_statistics_for_part_pruning]
+        && !query_info.isFinal()
+        && !(mutations_snapshot && (mutations_snapshot->hasDataMutations() || mutations_snapshot->hasPatchParts()))
+        && !storage.hasEnabledMaskingPolicies(context)
+        && !query_info.row_level_filter
+        && !getEffectiveRowPolicyFilter(storage, context);
+}
+
 RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByStatistics(
     const RangesInDataParts & parts,
     const StorageMetadataPtr & metadata_snapshot,
@@ -1042,39 +1060,9 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByStatistics(
 {
     const auto & settings = context->getSettingsRef();
 
-    /// Disable statistics-based pruning when:
-    /// 1. The setting is disabled
-    /// 2. The query uses FINAL
-    /// 3. There are on-the-fly mutations or patch parts (statistics only reflects original data).
-    ///    `hasAlterMutations` covers a pending `ALTER MODIFY COLUMN`, which is a `READ_COLUMN` alter
-    ///    mutation rather than a data mutation: a read already returns the converted values while the
-    ///    statistics still describe the values as they were written, so pruning a part against them
-    ///    drops rows the query has to see. `hasMetadataMutations` covers a pending `DROP COLUMN` or
-    ///    `RENAME COLUMN`: the statistics are loaded under the names the columns have in the part,
-    ///    so once a column with the same name is added again (or another column is renamed onto the
-    ///    dropped name), a read returns the new column while the stale statistics of the dropped one
-    ///    would prune the part. The neighbouring gate for the top-k minmax index
-    ///    (`partHasStaleTopKIndex`) fences the same mutation kinds. The alter and metadata mutations
-    ///    are checked per part below: the snapshot also holds finished ones, which must not disable
-    ///    the pruning of the parts they were already applied to.
-    /// 4. A masking policy applies: it rewrites values at read time, so the statistics (like
-    ///    the on-the-fly mutations above) no longer describe the values the query sees.
-    /// 5. A row policy applies: the statistics describe all rows of a part, including the ones the
-    ///    policy hides, so the number of rows left to read after pruning by the query's predicate,
-    ///    which is reported to the client, reveals the values of the hidden rows. The policy is
-    ///    either pushed into this read (possibly from a wrapper such as `Alias`) or belongs to
-    ///    this table and is applied above the read (e.g. for a child of `Merge`).
-    if (!settings[Setting::use_statistics_for_part_pruning]
-        || query_info.isFinal()
-        || (mutations_snapshot && (mutations_snapshot->hasDataMutations() || mutations_snapshot->hasPatchParts()))
-        || (!parts.empty() && parts.front().data_part->storage.hasEnabledMaskingPolicies(context))
-        || query_info.row_level_filter
-        || (!parts.empty() && getEffectiveRowPolicyFilter(parts.front().data_part->storage, context)))
-    {
-        return parts;
-    }
-
-    if (!query_info.filter_actions_dag)
+    if (parts.empty()
+        || !query_info.filter_actions_dag
+        || !canUseStatisticsForPartPruning(parts.front().data_part->storage, query_info, mutations_snapshot, context))
         return parts;
 
     const auto & filter_node = *query_info.filter_actions_dag->getOutputs().front();
@@ -1213,6 +1201,337 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByStatistics(
     }
 
     return res_parts;
+}
+
+Field MergeTreeDataSelectExecutor::TopKPartStats::getBestValue(int direction, int nulls_direction) const
+{
+    /// Opposite signs: NULL sorts first, so it is the best value when the part has one.
+    if (direction * nulls_direction < 0)
+        return null_rows > 0 ? Field() : (direction == 1 ? min : max);
+    return non_null_rows == 0 ? Field() : (direction == 1 ? min : max);
+}
+
+bool MergeTreeDataSelectExecutor::isColumnEligibleForTopKStatistics(
+    const StorageMetadataPtr & metadata_snapshot,
+    const TopKFilterInfo & top_k_filter_info)
+{
+    const auto & columns = metadata_snapshot->getColumns();
+    if (!columns.hasPhysical(top_k_filter_info.column_name))
+        return false;
+
+    const auto * col = columns.tryGet(top_k_filter_info.column_name);
+    if (!col || !col->type->equals(*top_k_filter_info.data_type)
+        || !col->statistics.types_to_desc.contains(StatisticsType::Basic)
+        || !canStatisticsTrackMinMax(col->type))
+        return false;
+
+    if (top_k_filter_info.threshold_tracker && top_k_filter_info.threshold_tracker->getCollator())
+        return false;
+
+    /// `getExtremes` omits `NaN`, so the bound is valid only for `ASC NULLS LAST`, where `NaN` sorts last.
+    if (hasTypeThatCanContainFloat(col->type) && (top_k_filter_info.direction != 1 || top_k_filter_info.nulls_direction != 1))
+        return false;
+
+    return true;
+}
+
+std::optional<MergeTreeDataSelectExecutor::TopKPartStats> MergeTreeDataSelectExecutor::extractTopKPartStats(
+    const IMergeTreeDataPart & part,
+    const String & column_name,
+    const DataTypePtr & metadata_type,
+    const Estimates & estimates)
+{
+    if (part.rows_count == 0)
+        return std::nullopt;
+
+    auto part_col = part.tryGetColumn(column_name);
+    if (!part_col || !isRepresentationPreservingConversion(part_col->type.get(), metadata_type.get()))
+        return std::nullopt;
+
+    auto it = estimates.find(column_name);
+    if (it == estimates.end())
+        return std::nullopt;
+
+    const Estimate & est = it->second;
+    if (!est.types.contains(StatisticsType::Basic) || !est.min_max_covers_all_values || est.rows_count != part.rows_count)
+        return std::nullopt;
+
+    UInt64 null_rows = 0;
+    if (isNullableOrLowCardinalityNullable(metadata_type))
+    {
+        if (!est.null_count_covers_all_rows || !est.estimated_null_count || *est.estimated_null_count > part.rows_count)
+            return std::nullopt;
+        null_rows = *est.estimated_null_count;
+    }
+
+    const UInt64 non_null_rows = part.rows_count - null_rows;
+    TopKPartStats res{.non_null_rows = non_null_rows, .null_rows = null_rows, .min = {}, .max = {}};
+    if (non_null_rows > 0)
+    {
+        if (!est.estimated_min || !est.estimated_max)
+            return std::nullopt;
+
+        const auto expected_field_type = removeLowCardinalityAndNullable(metadata_type)->getDefault().getType();
+        const Field & min_val = *est.estimated_min;
+        const Field & max_val = *est.estimated_max;
+        if (min_val.getType() != expected_field_type || max_val.getType() != expected_field_type
+            || isNaNField(min_val) || isNaNField(max_val) || min_val > max_val)
+            return std::nullopt;
+
+        res.min = min_val;
+        res.max = max_val;
+    }
+
+    return res;
+}
+
+namespace
+{
+
+/// Compares two `Field` values in `ORDER BY` order: `< 0` means `lhs` ranks before `rhs`.
+int compareTopKFields(const Field & lhs, const Field & rhs, int direction, int nulls_direction)
+{
+    if (lhs.isNull() || rhs.isNull())
+        return lhs.isNull() == rhs.isNull() ? 0 : (lhs.isNull() ? direction * nulls_direction : -direction * nulls_direction);
+    if (lhs < rhs)
+        return -direction;
+    if (rhs < lhs)
+        return direction;
+    return 0;
+}
+
+template <typename SkipPartFn>
+VectorWithMemoryTracking<std::optional<MergeTreeDataSelectExecutor::TopKPartStats>> loadTopKPartStats(
+    const RangesInDataParts & parts,
+    const String & col_name,
+    const DataTypePtr & metadata_type,
+    size_t min_marks_per_part_to_load_statistics,
+    size_t max_threads,
+    SkipPartFn && should_skip_part)
+{
+    const NameSet required_columns{col_name};
+
+    VectorWithMemoryTracking<std::optional<MergeTreeDataSelectExecutor::TopKPartStats>> stats(parts.size());
+    VectorWithMemoryTracking<char> decided(parts.size(), 0);
+    size_t num_parts_to_load = 0;
+    size_t marks_in_parts_to_load = 0;
+
+    for (size_t i = 0; i < parts.size(); ++i)
+    {
+        const auto & data_part = parts[i].data_part;
+        if (data_part->isProjectionPart() || data_part->rows_count == 0 || should_skip_part(parts[i]))
+        {
+            decided[i] = 1;
+        }
+        else if (auto estimates = data_part->tryGetEstimatesFromMemory(required_columns))
+        {
+            decided[i] = 1;
+            stats[i] = MergeTreeDataSelectExecutor::extractTopKPartStats(*data_part, col_name, metadata_type, *estimates);
+        }
+        else
+        {
+            ++num_parts_to_load;
+            marks_in_parts_to_load += parts[i].getMarksCount();
+        }
+    }
+
+    const size_t min_marks_to_load = MergeTreeDataSelectExecutor::getMinMarksToLoadStatistics(
+        min_marks_per_part_to_load_statistics, num_parts_to_load);
+
+    if (num_parts_to_load > 0 && marks_in_parts_to_load >= min_marks_to_load)
+    {
+        VectorWithMemoryTracking<Estimates> loaded_estimates(parts.size());
+        MergeTreeData::loadStatisticsOfPartsInParallel(
+            parts.size(),
+            max_threads,
+            [&](size_t i) { return decided[i] != 0; },
+            [&](size_t i)
+            {
+                if (!decided[i])
+                    loaded_estimates[i] = parts[i].data_part->getEstimates(required_columns);
+            },
+            [&](size_t i)
+            {
+                if (!decided[i])
+                {
+                    stats[i] = MergeTreeDataSelectExecutor::extractTopKPartStats(
+                        *parts[i].data_part, col_name, metadata_type, loaded_estimates[i]);
+                    loaded_estimates[i].clear();
+                }
+            });
+    }
+
+    return stats;
+}
+
+}
+
+RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByTopKStatistics(
+    const RangesInDataParts & parts,
+    const StorageMetadataPtr & metadata_snapshot,
+    const SelectQueryInfo & query_info,
+    const MergeTreeData::MutationsSnapshotPtr & mutations_snapshot,
+    const std::optional<TopKFilterInfo> & top_k_filter_info,
+    const MergeTreeDataSelectSamplingData & sampling,
+    size_t min_marks_per_part_to_load_statistics,
+    const ContextPtr & context,
+    LoggerPtr log,
+    ReadFromMergeTree::IndexStats & index_stats)
+{
+    /// Float row counts include `NaN` rows that min/max do not bound, so they cannot fill the cutoff.
+    if (parts.size() <= 1
+        || !top_k_filter_info
+        || top_k_filter_info->where_clause
+        || top_k_filter_info->limit_n == 0
+        || sampling.use_sampling
+        || query_info.filter_actions_dag
+        || metadata_snapshot->hasUniqueKey()
+        || (mutations_snapshot && mutations_snapshot->hasLightweightDeletedMask())
+        || hasTypeThatCanContainFloat(top_k_filter_info->data_type)
+        || !canUseStatisticsForPartPruning(parts.front().data_part->storage, query_info, mutations_snapshot, context)
+        || !isColumnEligibleForTopKStatistics(metadata_snapshot, *top_k_filter_info))
+    {
+        return parts;
+    }
+
+    const String & col_name = top_k_filter_info->column_name;
+    const auto & metadata_type = top_k_filter_info->data_type;
+    const auto stats = loadTopKPartStats(
+        parts,
+        col_name,
+        metadata_type,
+        min_marks_per_part_to_load_statistics,
+        context->getSettingsRef()[Setting::max_threads],
+        [&](const RangesInDataPart & part)
+        {
+            return part.data_part->hasLightweightDelete()
+                || part.getRowsCount() != part.data_part->rows_count
+                || partHasPendingAlterOrMetadataMutations(part.data_part, mutations_snapshot);
+        });
+
+    const int direction = top_k_filter_info->direction;
+    const int nulls_direction = top_k_filter_info->nulls_direction;
+    const UInt64 limit_n = top_k_filter_info->limit_n;
+
+    struct RowBucket
+    {
+        UInt64 rows;
+        Field worst;
+    };
+    VectorWithMemoryTracking<RowBucket> buckets;
+    buckets.reserve(parts.size());
+    for (const auto & st : stats)
+    {
+        if (!st)
+            continue;
+        if (st->null_rows > 0)
+            buckets.push_back({st->null_rows, Field()});
+        if (st->non_null_rows > 0)
+            buckets.push_back({st->non_null_rows, direction == 1 ? st->max : st->min});
+    }
+
+    std::sort(buckets.begin(), buckets.end(), [&](const RowBucket & a, const RowBucket & b)
+    {
+        return compareTopKFields(a.worst, b.worst, direction, nulls_direction) < 0;
+    });
+
+    std::optional<Field> cutoff;
+    UInt64 acc = 0;
+    for (const auto & bucket : buckets)
+    {
+        if (bucket.rows >= limit_n - acc)
+        {
+            cutoff = bucket.worst;
+            break;
+        }
+        acc += bucket.rows;
+    }
+    if (!cutoff)
+        return parts;
+
+    RangesInDataParts res_parts;
+    res_parts.reserve(parts.size());
+    for (size_t i = 0; i < parts.size(); ++i)
+    {
+        /// Strict `> 0` keeps parts whose best value ties `cutoff`, preserving secondary sort keys.
+        const bool pruned = stats[i]
+            && compareTopKFields(stats[i]->getBestValue(direction, nulls_direction), *cutoff, direction, nulls_direction) > 0;
+        if (pruned)
+            LOG_TRACE(log, "Part {} pruned by TopK statistics", parts[i].data_part->name);
+        else
+            res_parts.push_back(parts[i]);
+    }
+
+    if (res_parts.size() < parts.size())
+    {
+        size_t total_granules_after = 0;
+        for (const auto & part : res_parts)
+            total_granules_after += part.getMarksCount();
+
+        index_stats.emplace_back(ReadFromMergeTree::IndexStat{
+            .type = ReadFromMergeTree::IndexType::Statistics,
+            .description = "TopK",
+            .used_keys = {col_name},
+            .num_parts_after = res_parts.size(),
+            .num_granules_after = total_granules_after});
+
+        LOG_DEBUG(log, "TopK statistics pruning: {} parts -> {} parts", parts.size(), res_parts.size());
+    }
+
+    return res_parts;
+}
+
+void MergeTreeDataSelectExecutor::orderPartsByTopKStatistics(
+    RangesInDataParts & parts,
+    const StorageMetadataPtr & metadata_snapshot,
+    const TopKFilterInfo & top_k_filter_info,
+    size_t min_marks_per_part_to_load_statistics,
+    const ContextPtr & context)
+{
+    if (parts.size() <= 1 || !isColumnEligibleForTopKStatistics(metadata_snapshot, top_k_filter_info))
+        return;
+
+    const auto stats = loadTopKPartStats(
+        parts,
+        top_k_filter_info.column_name,
+        top_k_filter_info.data_type,
+        min_marks_per_part_to_load_statistics,
+        context->getSettingsRef()[Setting::max_threads],
+        [](const RangesInDataPart &) { return false; });
+
+    const int direction = top_k_filter_info.direction;
+    const int nulls_direction = top_k_filter_info.nulls_direction;
+
+    VectorWithMemoryTracking<std::optional<Field>> best_values(parts.size());
+    size_t valid_count = 0;
+    for (size_t i = 0; i < parts.size(); ++i)
+    {
+        if (stats[i])
+        {
+            best_values[i] = stats[i]->getBestValue(direction, nulls_direction);
+            ++valid_count;
+        }
+    }
+
+    if (valid_count < 2)
+        return;
+
+    VectorWithMemoryTracking<size_t> order(parts.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b)
+    {
+        if (best_values[a].has_value() != best_values[b].has_value())
+            return best_values[a].has_value();
+        if (!best_values[a].has_value())
+            return false;
+        return compareTopKFields(*best_values[a], *best_values[b], direction, nulls_direction) < 0;
+    });
+
+    RangesInDataParts reordered;
+    reordered.reserve(parts.size());
+    for (size_t idx : order)
+        reordered.push_back(std::move(parts[idx]));
+    parts = std::move(reordered);
 }
 
 

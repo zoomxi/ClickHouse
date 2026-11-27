@@ -32,11 +32,13 @@ struct SkipIndexReadResult
     std::shared_ptr<const Columns> primary_index_for_top_k;
     size_t top_k_primary_key_column_position = 0;
 
+    /// Best value of the sort column in the part. Once it falls outside `threshold_tracker`, every mark can be skipped.
+    std::optional<Field> top_k_part_best_value;
+
     /// Whether every row of the granule lies beyond the running top-K threshold according to the primary index.
     [[nodiscard]] bool isGranuleBeyondTopKThreshold(size_t mark) const;
 
-    /// Whether granules may be dropped by something other than the primary-key top-K check above: skip indexes
-    /// (the `minmax` top-K one included) or JOIN runtime filters.
+    /// True when something other than the top-K primary-key or part-statistics check can drop granules.
     bool may_skip_granules_besides_top_k_primary_key = true;
     /// Pre-computed index granules for indexes created for the whole part.
     IndexGranulesMap index_granules;
@@ -84,6 +86,9 @@ public:
     /// `primary_key_column_position`.
     void setTopKPrimaryKeyPruning(size_t primary_key_column_position, TopKThresholdTrackerPtr tracker);
 
+    /// Lets `read` and `canSkipMark` skip whole parts using `Basic` statistics against `tracker`.
+    void setTopKStatisticsPruning(String column_name, TopKThresholdTrackerPtr tracker);
+
     /// Prunes by the global row index `_part_starting_offset + _part_offset` with the predicate the builder makes on it.
     void setGlobalRowIndexPruning(DynamicPredicateBuilder predicate_builder);
 
@@ -109,6 +114,7 @@ private:
     DynamicSkipIndexFilter dynamic_skip_index_filter;
 
     std::optional<size_t> top_k_primary_key_column_position;
+    std::optional<String> top_k_stats_column;
     TopKThresholdTrackerPtr top_k_threshold_tracker;
     ContextPtr context;
     LoggerPtr log;

@@ -103,6 +103,7 @@ struct TopKFilterInfo
     size_t num_sort_columns;
     size_t limit_n;
     int direction; /// 1 = ASC, -1 = DESC
+    int nulls_direction = 1; /// 1 = NULLS LAST (ASC) / NULLS FIRST (DESC), -1 = opposite
     bool where_clause;
     TopKThresholdTrackerPtr threshold_tracker;
 

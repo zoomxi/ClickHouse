@@ -417,7 +417,8 @@ static TopKThresholdTrackerPtr tryAttachDynamicFilter(
     /// `where_clause = true` keeps `MergeTreeDataSelectExecutor` from narrowing the read up front to the granules
     /// that hold the `LIMIT` smallest rows (`getTopKMarks`): a group needs all of its rows, and `LIMIT` rows may
     /// hold fewer than `LIMIT` distinct keys. Only the boundary-driven filtering and granule skipping apply here.
-    TopKFilterInfo info{key_name, key_column.type, num_key_columns, limit, direction, /*where_clause=*/ true, threshold_tracker, /*condition_hash=*/ 0};
+    TopKFilterInfo info{
+        key_name, key_column.type, num_key_columns, limit, direction, nulls_direction, /*where_clause=*/ true, threshold_tracker, /*condition_hash=*/ 0};
 
     /// Built the way `installTopKDynamicFilter` builds it: the existing PREWHERE must not depend on its block, and
     /// `__topKFilter` must bind to the column the read produces, not to a computed node of the PREWHERE under its name.

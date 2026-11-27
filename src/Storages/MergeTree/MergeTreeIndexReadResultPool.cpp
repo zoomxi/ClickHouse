@@ -6,6 +6,7 @@
 #include <Storages/MergeTree/MergeTreeIndexGranularity.h>
 #include <Storages/MergeTree/MergeTreeReadPoolProjectionIndex.h>
 #include <Storages/MergeTree/MergeTreeSelectProcessor.h>
+#include <Core/Settings.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Functions/FunctionFactory.h>
@@ -34,6 +35,11 @@ namespace ProfileEvents
 
 namespace DB
 {
+
+namespace Setting
+{
+    extern const SettingsUInt64 min_marks_per_part_to_load_statistics;
+}
 
 namespace ErrorCodes
 {
@@ -82,6 +88,12 @@ void MergeTreeSkipIndexReader::setTopKPrimaryKeyPruning(size_t primary_key_colum
     top_k_threshold_tracker = std::move(tracker);
 }
 
+void MergeTreeSkipIndexReader::setTopKStatisticsPruning(String column_name, TopKThresholdTrackerPtr tracker)
+{
+    top_k_stats_column = std::move(column_name);
+    top_k_threshold_tracker = std::move(tracker);
+}
+
 void MergeTreeSkipIndexReader::setGlobalRowIndexPruning(DynamicPredicateBuilder predicate_builder)
 {
     global_row_index_predicate_builder = std::move(predicate_builder);
@@ -121,6 +133,45 @@ SkipIndexReadResultPtr MergeTreeSkipIndexReader::read(
     auto ranges = input.ranges;
     size_t total_granules = ranges.getNumberOfMarks();
 
+    auto try_get_top_k_part_best_value = [&]() -> std::optional<Field>
+    {
+        if (!top_k_stats_column || !top_k_threshold_tracker || part_info->isProjectionPart() || ranges.empty()
+            || all_updated_columns.contains(*top_k_stats_column) || value_updated_columns.contains(*top_k_stats_column))
+            return std::nullopt;
+
+        auto data_part = part_info->getDataPart();
+        if (!data_part)
+            return std::nullopt;
+
+        auto metadata_col = metadata_snapshot->getColumns().tryGetPhysical(*top_k_stats_column);
+        if (!metadata_col)
+            return std::nullopt;
+
+        const NameSet required_columns{*top_k_stats_column};
+        std::optional<Estimates> estimates = data_part->tryGetEstimatesFromMemory(required_columns);
+        if (!estimates && total_granules >= context->getSettingsRef()[Setting::min_marks_per_part_to_load_statistics])
+            estimates = data_part->getEstimates(required_columns);
+        if (!estimates)
+            return std::nullopt;
+
+        auto stats = MergeTreeDataSelectExecutor::extractTopKPartStats(
+            *data_part, *top_k_stats_column, metadata_col->type, *estimates);
+        if (!stats)
+            return std::nullopt;
+
+        return stats->getBestValue(top_k_threshold_tracker->getDirection(), top_k_threshold_tracker->getNullsDirection());
+    };
+
+    std::optional<Field> top_k_part_best_value = try_get_top_k_part_best_value();
+    if (top_k_part_best_value && top_k_threshold_tracker->isSet()
+        && !top_k_threshold_tracker->isValueInsideThreshold(*top_k_part_best_value))
+    {
+        LOG_DEBUG(log, "TopK statistics skipped part {} ({} granules)", part_info->getPartName(), total_granules);
+        ranges.clear();
+        total_granules = 0;
+        top_k_part_best_value.reset();
+    }
+
     /// index analysis lists only the indexes that it applies itself
     auto add_used_index = [&](const String & index_name)
     {
@@ -133,7 +184,7 @@ SkipIndexReadResultPtr MergeTreeSkipIndexReader::read(
     IndexGranulesMap index_granules;
 
     /// The same RPN template must be used for sizing the bitset, recording and merging the partial results.
-    const KeyCondition * rpn_template_for_part = use_for_disjunctions ? &key_condition_rpn_template->generateForPart(*part_info) : nullptr;
+    const KeyCondition * rpn_template_for_part = (use_for_disjunctions && !ranges.empty()) ? &key_condition_rpn_template->generateForPart(*part_info) : nullptr;
 
     MergeTreeDataSelectExecutor::PartialDisjunctionResult partial_eval_results;
     if (rpn_template_for_part)
@@ -333,7 +384,7 @@ SkipIndexReadResultPtr MergeTreeSkipIndexReader::read(
     /// indexes: a pending mutation that rewrites, drops or renames its column leaves the part with an
     /// index file that does not describe the values a read returns, so pruning marks by the running
     /// threshold against it would drop rows the query has to see.
-    if (skip_indexes.skip_index_for_top_k_filtering && skip_indexes.threshold_tracker
+    if (!ranges.empty() && skip_indexes.skip_index_for_top_k_filtering && skip_indexes.threshold_tracker
         && MergeTreeDataSelectExecutor::canUseIndex(skip_indexes.skip_index_for_top_k_filtering, metadata_snapshot, all_updated_columns, value_updated_columns, context, &part_info->getSecondaryIndexColumnTypes()))
     {
         res->min_max_index_for_top_k = MergeTreeDataSelectExecutor::getMinMaxIndexGranules(
@@ -356,7 +407,7 @@ SkipIndexReadResultPtr MergeTreeSkipIndexReader::read(
         = !skip_indexes.useful_indices.empty() || use_for_disjunctions || hasRuntimeFilters() || res->min_max_index_for_top_k;
 
     /// Projection parts have a primary key of their own, which the position was not computed for.
-    if (top_k_primary_key_column_position && top_k_threshold_tracker && !part_info->isProjectionPart())
+    if (!ranges.empty() && top_k_primary_key_column_position && top_k_threshold_tracker && !part_info->isProjectionPart())
     {
         if (auto data_part = part_info->getDataPart())
         {
@@ -369,6 +420,12 @@ SkipIndexReadResultPtr MergeTreeSkipIndexReader::read(
                 res->threshold_tracker = top_k_threshold_tracker;
             }
         }
+    }
+
+    if (top_k_part_best_value && !ranges.empty())
+    {
+        res->top_k_part_best_value = std::move(top_k_part_best_value);
+        res->threshold_tracker = top_k_threshold_tracker;
     }
 
     return res;
@@ -768,6 +825,10 @@ bool MergeTreeIndexReadResult::canSkipMark(size_t mark, const MergeTreeIndexGran
         chassert(mark < skip_result.granules_selected.size());
 
         if (!skip_result.granules_selected.at(mark))
+            return true;
+
+        if (skip_result.threshold_tracker && skip_result.threshold_tracker->isSet() && skip_result.top_k_part_best_value
+            && !skip_result.threshold_tracker->isValueInsideThreshold(*skip_result.top_k_part_best_value))
             return true;
 
         if (skip_result.threshold_tracker && skip_result.threshold_tracker->isSet() && skip_result.min_max_index_for_top_k)

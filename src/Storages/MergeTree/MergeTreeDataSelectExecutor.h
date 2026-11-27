@@ -313,6 +313,51 @@ public:
         ReadFromMergeTree::IndexStats & index_stats,
         RangesInDataParts * deferred_parts = nullptr);
 
+    static bool canUseStatisticsForPartPruning(
+        const MergeTreeData & storage,
+        const SelectQueryInfo & query_info,
+        const MergeTreeData::MutationsSnapshotPtr & mutations_snapshot,
+        const ContextPtr & context);
+
+    struct TopKPartStats
+    {
+        UInt64 non_null_rows = 0;
+        UInt64 null_rows = 0;
+        Field min;
+        Field max;
+
+        [[nodiscard]] Field getBestValue(int direction, int nulls_direction) const;
+    };
+
+    static bool isColumnEligibleForTopKStatistics(
+        const StorageMetadataPtr & metadata_snapshot,
+        const TopKFilterInfo & top_k_filter_info);
+
+    static std::optional<TopKPartStats> extractTopKPartStats(
+        const IMergeTreeDataPart & part,
+        const String & column_name,
+        const DataTypePtr & metadata_type,
+        const Estimates & estimates);
+
+    static RangesInDataParts filterPartsByTopKStatistics(
+        const RangesInDataParts & parts,
+        const StorageMetadataPtr & metadata_snapshot,
+        const SelectQueryInfo & query_info,
+        const MergeTreeData::MutationsSnapshotPtr & mutations_snapshot,
+        const std::optional<TopKFilterInfo> & top_k_filter_info,
+        const MergeTreeDataSelectSamplingData & sampling,
+        size_t min_marks_per_part_to_load_statistics,
+        const ContextPtr & context,
+        LoggerPtr log,
+        ReadFromMergeTree::IndexStats & index_stats);
+
+    static void orderPartsByTopKStatistics(
+        RangesInDataParts & parts,
+        const StorageMetadataPtr & metadata_snapshot,
+        const TopKFilterInfo & top_k_filter_info,
+        size_t min_marks_per_part_to_load_statistics,
+        const ContextPtr & context);
+
     struct IndexAnalysisContext
     {
         StorageMetadataPtr metadata_snapshot;

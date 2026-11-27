@@ -350,7 +350,17 @@ size_t tryOptimizeTopK(QueryPlan::Node * parent_node, QueryPlan::Nodes & /*nodes
 
     if (use_skip_index || use_dynamic_filtering)
     {
-        TopKFilterInfo info{sort_column_name, sort_column.type, num_sort_columns, n, sort_col_desc.direction, where_clause, threshold_tracker, /*condition_hash=*/ 0, /*dynamic_filter_pending=*/ use_dynamic_filtering};
+        TopKFilterInfo info{
+            sort_column_name,
+            sort_column.type,
+            num_sort_columns,
+            n,
+            sort_col_desc.direction,
+            sort_col_desc.nulls_direction,
+            where_clause,
+            threshold_tracker,
+            /*condition_hash=*/ 0,
+            /*dynamic_filter_pending=*/ use_dynamic_filtering};
         if (use_dynamic_filtering && single_string_sort_column)
             info.rows_equal_to_threshold_dropped = std::make_shared<std::atomic<bool>>(false);
 
