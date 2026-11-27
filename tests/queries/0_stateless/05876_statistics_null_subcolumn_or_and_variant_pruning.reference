@@ -1,0 +1,80 @@
+--- OR of two IS NULL (numeric), opt=1 and opt=0
+1	1
+7
+1	1
+7
+--- OR of two IS NULL (String + LC(Nullable(String))), opt=1 and opt=0
+1	1
+7
+1	1
+7
+--- Same column range OR IS NULL (both `a` and `a.null` in DAG, key deduplicated)
+1	1	1
+7
+7
+--- Nested (IS NULL AND range) OR (IS NULL AND range)
+1	1
+2
+2
+--- NOT (a IS NULL AND b IS NULL)
+1	1
+9
+9
+--- Range AND (s1 IS NULL OR b IS NOT NULL) prunes Part 4 too
+1	1
+5
+--- Unprunable OR drops dead `.null` key and does not load statistics
+1
+7
+1	1	1	1
+2
+--- Float64 with NaN: IS NOT NULL / NOT (IS NULL) still prunes all-NULL parts and keeps NaN
+1	1
+7
+1	1
+7
+--- Explicit `.null` comparisons respect `[1, 255]` semantics
+1	1
+5
+1	1
+7
+7
+--- Nullable(JSON) `.null` path inside OR is not mistaken for null-map
+1
+2
+--- Variant and Dynamic NULL-count part pruning
+v IS NULL
+1	1
+5
+v IS NOT NULL
+1	1
+7
+d IS NULL
+1	1
+5
+d IS NOT NULL
+1	1
+7
+v IS NULL OR d IS NULL
+1	1
+7
+v IS NULL OR x > 100
+1	1
+7
+unprunable v IS NULL OR u = p1
+1
+7
+value comparisons on Variant/Dynamic stay exact (incl. NOT / != / NOT IN)
+1
+6
+1
+2
+5
+2
+11
+10
+1
+6
+1
+7
+11

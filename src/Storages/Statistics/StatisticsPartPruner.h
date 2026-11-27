@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Common/UnorderedMapWithMemoryTracking.h>
 #include <Core/Names.h>
 #include <Storages/MergeTree/KeyCondition.h>
 #include <Storages/Statistics/Statistics.h>
@@ -23,7 +24,7 @@ public:
     ///   - can_be_false: whether any rows in the part might not satisfy the condition
     BoolMask checkPartCanMatch(const Estimates & estimates);
 
-    /// Returns true if no columns with MinMax statistics are used in the filter, then all parts will match.
+    /// Returns true if no columns with usable statistics are used in the filter, then all parts will match.
     [[nodiscard]] bool isUseless() const { return useless; }
 
     /// Get the list of column names used in the filter condition that have statistics.
@@ -33,13 +34,23 @@ public:
     [[nodiscard]] NameSet getRequiredColumns() const;
 
 private:
+    struct CachedKeyCondition
+    {
+        std::unique_ptr<KeyCondition> condition;
+        bool used_columns_recorded = false;
+    };
+
     /// Get or create a KeyCondition for the given columns, using cache to avoid recreating for each part.
     KeyCondition * getKeyConditionForEstimates(const NamesAndTypesList & columns_and_types, bool record_used_columns = true);
 
-    /// Cache key_condition by column names to avoid recreating them for each part.
-    std::unordered_map<Names, std::unique_ptr<KeyCondition>, NamesHash> key_condition_cache;
+    /// Resolve a virtual `<parent>.null` key back to its physical parent column name.
+    [[nodiscard]] const String & resolveParentColumn(const String & name) const;
 
-    std::vector<std::pair<String, bool>> null_predicates;
+    /// Cache key_condition by column names to avoid recreating them for each part.
+    std::unordered_map<Names, CachedKeyCondition, NamesHash> key_condition_cache;
+
+    /// Virtual `<parent>.null` keys registered in `stats_column_name_to_type_map`, mapped to their physical parent.
+    UnorderedMapWithMemoryTracking<String, String> null_subcolumn_to_parent;
 
     const ActionsDAGWithInversionPushDown filter_dag;
     const ContextPtr context;

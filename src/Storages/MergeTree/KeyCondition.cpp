@@ -8168,7 +8168,7 @@ bool rangeOfKeyColumnMayHoldNull(
         return false;
 
     const auto & key_type = key_types[key_position];
-    return (key_range.right.isPositiveInfinity() && isNullableOrLowCardinalityNullable(key_type))
+    return (key_range.right.isPositiveInfinity() && canContainNull(*key_type))
         || (atomMayClaimNestedNullOrNaN(element) && keyTypeMayHoldNestedNullOrNaN(key_type));
 }
 
@@ -8221,8 +8221,8 @@ bool atomIsNullForNullArgument(KeyCondition::RPNElement::Function function)
 /// NULL row lies inside the range" turns, under negation, into "every row lies outside it", which
 /// reports a granule of NULLs as wholly matching a negated comparison - and the exact-count
 /// optimization then counts the very rows the `WHERE` throws away. So the exactness of the whole
-/// analysis is gone as soon as one such atom reads a `Nullable` key column whose range may hold a
-/// NULL, or a composite key column whose values may carry a nested `NULL` or `NaN`, which is the same
+/// analysis is gone as soon as one such atom reads a key column that can contain NULL and whose range may hold one,
+/// or a composite key column whose values may carry a nested `NULL` or `NaN`, which is the same
 /// "neither true nor false" at row level. `IS NULL` and `IS NOT NULL` are excluded: they answer true or false for a NULL as well, so
 /// the algebra describes them exactly. Only `can_be_false` is affected; `can_be_true`, and with it
 /// every pruning decision, is left alone.

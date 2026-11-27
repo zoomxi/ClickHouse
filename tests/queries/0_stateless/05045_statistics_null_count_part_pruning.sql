@@ -66,10 +66,9 @@ SELECT countIf(explain LIKE '%Statistics%') > 0, countIf(explain LIKE '%Parts: 3
 FROM (EXPLAIN indexes = 1 SELECT count() FROM test_nullcount_pruning WHERE NOT (value IS NULL));
 SELECT count() FROM test_nullcount_pruning WHERE NOT (value IS NULL);
 
-SELECT 'Test 7: `IS NULL OR range` does not prune (NULL-count pruning needs a top-level conjunct)';
--- The bare `value.null` input inside the OR is unknown to the range analysis, so nothing is
--- pruned and the `Statistics` index section does not appear (same as without this PR).
-SELECT countIf(explain LIKE '%Statistics%') = 0
+SELECT 'Test 7: `IS NULL OR range` prunes via unified `<col>.null` KeyCondition';
+-- Part 0 matches `value IS NULL`, parts 2 and 3 match `value_for_range >= 150`; part 1 is pruned.
+SELECT countIf(explain LIKE '%Statistics%') > 0, countIf(explain LIKE '%Parts: 3/4%') > 0
 FROM (EXPLAIN indexes = 1 SELECT count() FROM test_nullcount_pruning WHERE value IS NULL OR value_for_range >= 150);
 SELECT count() FROM test_nullcount_pruning WHERE value IS NULL OR value_for_range >= 150;
 
@@ -145,8 +144,8 @@ SELECT
     countIf(explain LIKE '%Parts: 2/4%') > 0,
     countIf(trim(replaceAll(explain, '│', '')) = 'value_for_range') > 0,
     countIf(trim(replaceAll(explain, '│', '')) = 'value_lc') = 0
-FROM (EXPLAIN indexes = 1 SELECT count() FROM test_nullcount_pruning WHERE value_for_range > 150 AND (value_lc IS NULL OR value IS NOT NULL));
-SELECT count() FROM test_nullcount_pruning WHERE value_for_range > 150 AND (value_lc IS NULL OR value IS NOT NULL);
+FROM (EXPLAIN indexes = 1 SELECT count() FROM test_nullcount_pruning WHERE value_for_range > 150 AND (value_lc IS NULL OR id > 0));
+SELECT count() FROM test_nullcount_pruning WHERE value_for_range > 150 AND (value_lc IS NULL OR id > 0);
 
 DROP TABLE test_nullcount_pruning;
 

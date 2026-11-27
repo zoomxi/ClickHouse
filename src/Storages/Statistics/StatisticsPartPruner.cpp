@@ -1,7 +1,9 @@
-#include <Columns/ColumnConst.h>
+#include <Common/UnorderedSetWithMemoryTracking.h>
 #include <Core/Field.h>
 #include <Core/NamesAndTypes.h>
 #include <DataTypes/DataTypeLowCardinality.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/IDataType.h>
 #include <Functions/IFunction.h>
 #include <Interpreters/ExpressionActions.h>
@@ -18,32 +20,23 @@ namespace DB
 namespace
 {
 
-/// Create a Range from statistics estimate for use in part pruning.
-/// MinMax statistics now store typed Field values, so we can directly construct Range
-/// without lossy Float64 conversions.
-///
-/// NULL handling: a Nullable column's NULL values sort at POSITIVE_INFINITY. When the NULL
-/// count is known (`Basic` statistics on a nullable column), the range can be tightened:
-///   - null_count == 0: no NULLs in the part, the right bound is the real max;
-///   - null_count == rows_count: the part is all-NULL, represented by the [+inf, +inf] sentinel
-///     range (it intersects nothing except ranges that reach the NULL sentinel);
-///   - otherwise the right bound stays POSITIVE_INFINITY to cover possible NULLs.
-///
-/// Returns std::nullopt when statistics are unavailable or corrupted,
-/// causing the caller to fall back to a whole-universe Range (no pruning).
-std::optional<Range> createRangeFromEstimate(const Estimate & estimate, bool is_nullable)
+/// Range from min/max and a NULL count that covers every row. NULL sorts as +inf.
+/// No NULLs: [min, max], or (-inf, +inf) when min/max are absent.
+/// All NULLs: [+inf, +inf]. Some NULLs: [min, +inf], or nullopt without min/max.
+/// nullopt: statistics are missing or corrupt, and the caller must not prune.
+std::optional<Range> createRangeFromEstimate(const Estimate & estimate, bool can_contain_null)
 {
     if (estimate.rows_count == 0)
         return std::nullopt;
 
-    const std::optional<UInt64> & null_count = estimate.estimated_null_count;
+    const std::optional<UInt64> null_count = estimate.null_count_covers_all_rows ? estimate.estimated_null_count : std::nullopt;
     if (null_count.has_value() && *null_count > estimate.rows_count)
         return std::nullopt;
 
-    if (is_nullable && null_count.has_value() && *null_count == estimate.rows_count)
+    if (can_contain_null && null_count.has_value() && *null_count == estimate.rows_count)
         return Range(POSITIVE_INFINITY, true, POSITIVE_INFINITY, true);
 
-    const bool no_nulls = !is_nullable || (null_count.has_value() && *null_count == 0);
+    const bool no_nulls = !can_contain_null || (null_count.has_value() && *null_count == 0);
 
     if (estimate.estimated_min.has_value() && estimate.estimated_max.has_value())
     {
@@ -57,15 +50,28 @@ std::optional<Range> createRangeFromEstimate(const Estimate & estimate, bool is_
         if (no_nulls)
             return Range(min_value, true, max_value, true);
 
-        /// Nullable column that may contain NULLs: keep the right bound at the NULL sentinel.
+        /// Some NULLs: keep the right bound at the NULL sentinel.
         return Range(min_value, true, POSITIVE_INFINITY, true);
     }
 
-    /// No min/max (non-numeric type like String/Array/Tuple/Map): a known-zero NULL count
-    /// still excludes the NULL sentinel.
-    if (is_nullable && no_nulls)
+    /// No min/max: a known-zero NULL count is still (-inf, +inf), excluding the NULL sentinel.
+    if (can_contain_null && no_nulls)
         return Range::createWholeUniverseWithoutNull();
 
+    return std::nullopt;
+}
+
+/// `<col>.null` (`UInt8`) from the parent NULL count. All-NULL is `[1, 255]`: a null-map byte only has to be non-zero.
+std::optional<Range> createNullSubcolumnRangeFromEstimate(const Estimate & estimate)
+{
+    if (estimate.rows_count == 0 || !estimate.null_count_covers_all_rows
+        || !estimate.estimated_null_count.has_value() || *estimate.estimated_null_count > estimate.rows_count)
+        return std::nullopt;
+
+    if (*estimate.estimated_null_count == 0)
+        return Range(Field(UInt64(0)), true, Field(UInt64(0)), true);
+    if (*estimate.estimated_null_count == estimate.rows_count)
+        return Range(Field(UInt64(1)), true, Field(UInt64(255)), true);
     return std::nullopt;
 }
 
@@ -83,10 +89,8 @@ bool statisticsHasMinMaxForPartPruning(const ColumnStatisticsDescription & stats
     return false;
 }
 
-/// If `name` is the virtual `<parent>.null` null-map (from `IS NULL` rewritten by
-/// `optimize_functions_to_subcolumns`), return the parent column. A physical column
-/// literally named `foo.null` wins. A parent whose nested type owns a `null` subcolumn
-/// (e.g. `Nullable(JSON)`, where `json.null` is a `Dynamic` path) is excluded.
+/// Virtual `<parent>.null` from `optimize_functions_to_subcolumns`. A real column `foo.null` wins.
+/// A parent whose nested type has its own `null` subcolumn (`Nullable(JSON)`) is not a null map.
 std::optional<String> tryResolveNullMapParent(const ColumnsDescription & columns, const String & name)
 {
     static constexpr std::string_view suffix = ".null";
@@ -95,101 +99,26 @@ std::optional<String> tryResolveNullMapParent(const ColumnsDescription & columns
 
     String parent = name.substr(0, name.size() - suffix.size());
     const auto * parent_col = columns.tryGet(parent);
-    if (!parent_col || removeLowCardinalityAndNullable(parent_col->type)->hasSubcolumn("null"))
+    if (!parent_col || !isNullableOrLowCardinalityNullable(parent_col->type)
+        || removeLowCardinalityAndNullable(parent_col->type)->hasSubcolumn("null"))
         return std::nullopt;
     return parent;
 }
 
-bool hasBasicStatsOnNullableType(const ColumnDescription & col)
+bool hasBasicNullCount(const ColumnDescription & col)
 {
-    return col.statistics.types_to_desc.contains(StatisticsType::Basic)
-        && isNullableOrLowCardinalityNullable(col.type);
+    return col.statistics.types_to_desc.contains(StatisticsType::Basic) && canContainNull(*col.type);
 }
 
-bool rejectsNullCountWitness(const KeyCondition & key_condition, const DataTypePtr & type)
+/// True when all-NULL or no-NULL is not a trivial maybe, so the column can prune inside an `OR`.
+bool respondsToNullCountWitness(const KeyCondition & key_condition, const DataTypePtr & type)
 {
     const DataTypes types{type};
-    const bool all_null_possible = key_condition.checkInHyperrectangle(
-        Hyperrectangle(1, Range(POSITIVE_INFINITY, true, POSITIVE_INFINITY, true)), types).can_be_true;
-    const bool no_null_possible = key_condition.checkInHyperrectangle(
-        Hyperrectangle(1, Range::createWholeUniverseWithoutNull()), types).can_be_true;
-    return !all_null_possible || !no_null_possible;
-}
-
-bool isConstantZero(const ActionsDAG::Node & node)
-{
-    if (node.type != ActionsDAG::ActionType::COLUMN || !node.column)
-        return false;
-
-    const Field value = (*node.column)[0];
-    if (value.getType() == Field::Types::UInt64)
-        return value.safeGet<UInt64>() == 0;
-    if (value.getType() == Field::Types::Int64)
-        return value.safeGet<Int64>() == 0;
-    return false;
-}
-
-/// Collect top-level `AND` conjuncts testing a column's NULL-ness: a bare `<col>.null`
-/// input, `not(<col>.null)`, `<col>.null != 0` / `<col>.null = 0` (the
-/// `optimize_functions_to_subcolumns` rewrite of `isNull` / the complementary form),
-/// or `isNull(<col>)` / `isNotNull(<col>)` on a bare column.
-/// The constructor keeps only columns with `Basic` statistics on a nullable type, so a
-/// lone `IS NULL` that cannot prune does not load per-part statistics.
-void collectNullPredicates(
-    const ActionsDAG::Node & node,
-    const ColumnsDescription & columns,
-    std::vector<std::pair<String, bool>> & out)
-{
-    if (node.type == ActionsDAG::ActionType::INPUT)
-    {
-        if (auto parent = tryResolveNullMapParent(columns, node.result_name))
-            out.emplace_back(*parent, true);
-        return;
-    }
-
-    if (node.type != ActionsDAG::ActionType::FUNCTION || !node.function_base)
-        return;
-
-    const auto & name = node.function_base->getName();
-    if (name == "and")
-    {
-        for (const auto * child : node.children)
-            collectNullPredicates(*child, columns, out);
-        return;
-    }
-
-    if (node.children.size() == 1 && node.children.front()->type == ActionsDAG::ActionType::INPUT)
-    {
-        const String & arg_name = node.children.front()->result_name;
-        if (name == "not")
-        {
-            if (auto parent = tryResolveNullMapParent(columns, arg_name))
-                out.emplace_back(*parent, false);
-        }
-        else if (name == "isNull" || name == "isNotNull")
-        {
-            out.emplace_back(arg_name, name == "isNull");
-        }
-        return;
-    }
-
-    /// `isNull(col)` with `optimize_functions_to_subcolumns = 1` is rewritten to
-    /// `<col>.null != 0`. Only 0 qualifies: a NULL-map byte only has to be non-zero
-    /// to mean NULL. `= 0` is the complementary `IS NOT NULL` form.
-    if (node.children.size() == 2 && (name == "equals" || name == "notEquals"))
-    {
-        const ActionsDAG::Node * input = nullptr;
-        if (node.children[0]->type == ActionsDAG::ActionType::INPUT && isConstantZero(*node.children[1]))
-            input = node.children[0];
-        else if (node.children[1]->type == ActionsDAG::ActionType::INPUT && isConstantZero(*node.children[0]))
-            input = node.children[1];
-
-        if (input)
-        {
-            if (auto parent = tryResolveNullMapParent(columns, input->result_name))
-                out.emplace_back(*parent, name == "notEquals");
-        }
-    }
+    const auto all_null = key_condition.checkInHyperrectangle(
+        Hyperrectangle(1, Range(POSITIVE_INFINITY, true, POSITIVE_INFINITY, true)), types);
+    const auto no_null = key_condition.checkInHyperrectangle(
+        Hyperrectangle(1, Range::createWholeUniverseWithoutNull()), types);
+    return !all_null.can_be_true || !all_null.can_be_false || !no_null.can_be_true || !no_null.can_be_false;
 }
 
 /// Functions that negate a comparison, i.e. can be `true` for a `NaN` operand. `NaN` never
@@ -287,52 +216,73 @@ StatisticsPartPruner::StatisticsPartPruner(const StorageMetadataPtr & metadata_,
         if (const auto * col = columns.tryGet(name))
         {
             if (statisticsHasMinMaxForPartPruning(col->statistics))
-            {
                 stats_column_name_to_type_map[col->name] = col->type;
-                useless = false;
-            }
-            else if (hasBasicStatsOnNullableType(*col))
-            {
+            else if (hasBasicNullCount(*col))
                 nullable_only_columns[col->name] = col->type;
+        }
+        else if (auto parent = tryResolveNullMapParent(columns, name))
+        {
+            const auto * parent_col = columns.tryGet(*parent);
+            if (parent_col && parent_col->statistics.types_to_desc.contains(StatisticsType::Basic))
+            {
+                stats_column_name_to_type_map[name] = std::make_shared<DataTypeUInt8>();
+                null_subcolumn_to_parent.emplace(name, std::move(*parent));
             }
         }
     }
 
-    std::vector<std::pair<String, bool>> collected_null_predicates;
-    collectNullPredicates(*filter_dag.predicate, columns, collected_null_predicates);
-    for (const auto & pred : collected_null_predicates)
-    {
-        const auto * col = columns.tryGet(pred.first);
-        if (!col || !hasBasicStatsOnNullableType(*col))
-            continue;
-
-        null_predicates.push_back(pred);
-        used_column_names.insert(pred.first);
-        useless = false;
-    }
-
-    /// Keep a nullable-only column only when it can exclude all-NULL or no-NULL parts by itself.
     for (const auto & [col_name, col_type] : nullable_only_columns)
     {
         NamesAndTypesList one_col;
         one_col.emplace_back(col_name, col_type);
-        KeyCondition * key_condition = getKeyConditionForEstimates(one_col, /*record_used_columns=*/ false);
-        if (!key_condition || !rejectsNullCountWitness(*key_condition, col_type))
-            continue;
-
-        stats_column_name_to_type_map[col_name] = col_type;
-        used_column_names.insert(col_name);
-        useless = false;
+        ActionsDAG actions_dag(one_col);
+        auto expression = std::make_shared<ExpressionActions>(std::move(actions_dag));
+        KeyCondition probe(
+            filter_dag, context, one_col.getNames(), expression,
+            /* single_point_ */ false, /* skip_analysis_ */ false, /* require_ready_sets_ */ true);
+        probe.relaxAtomsOverNaNHidingColumns(one_col.getTypes());
+        if (respondsToNullCountWitness(probe, col_type))
+            stats_column_name_to_type_map[col_name] = col_type;
     }
+
+    if (stats_column_name_to_type_map.empty())
+        return;
+
+    NamesAndTypesList all_columns;
+    for (const auto & [col_name, col_type] : stats_column_name_to_type_map)
+        all_columns.emplace_back(col_name, col_type);
+
+    KeyCondition * key_condition = getKeyConditionForEstimates(all_columns, /*record_used_columns=*/ false);
+    if (!key_condition)
+    {
+        stats_column_name_to_type_map.clear();
+        null_subcolumn_to_parent.clear();
+        return;
+    }
+
+    /// Drop keys used only in an unprunable branch (`a.null OR u = 1`) so those statistics are not loaded.
+    const auto used_keys = key_condition->getDescription().used_keys;
+    if (!used_keys.empty() && used_keys.size() < stats_column_name_to_type_map.size())
+    {
+        UnorderedSetWithMemoryTracking<String> used_set(used_keys.begin(), used_keys.end());
+        std::erase_if(stats_column_name_to_type_map, [&](const auto & item) { return !used_set.contains(item.first); });
+        std::erase_if(null_subcolumn_to_parent, [&](const auto & item) { return !used_set.contains(item.first); });
+    }
+
+    useless = stats_column_name_to_type_map.empty();
+}
+
+const String & StatisticsPartPruner::resolveParentColumn(const String & name) const
+{
+    auto it = null_subcolumn_to_parent.find(name);
+    return it != null_subcolumn_to_parent.end() ? it->second : name;
 }
 
 NameSet StatisticsPartPruner::getRequiredColumns() const
 {
     NameSet result;
     for (const auto & [col_name, _] : stats_column_name_to_type_map)
-        result.insert(col_name);
-    for (const auto & [col_name, _] : null_predicates)
-        result.insert(col_name);
+        result.insert(resolveParentColumn(col_name));
     return result;
 }
 
@@ -340,40 +290,35 @@ KeyCondition * StatisticsPartPruner::getKeyConditionForEstimates(const NamesAndT
 {
     const auto column_names = columns.getNames();
 
-    auto it = key_condition_cache.find(column_names);
-    if (it != key_condition_cache.end())
-        return it->second.get();
-
-    ActionsDAG actions_dag(columns);
-    auto expression = std::make_shared<ExpressionActions>(std::move(actions_dag));
-
-    /// Pruning estimates must not run a query pipeline: only state that is already computed may be
-    /// read here.
-    auto new_key_condition = std::make_unique<KeyCondition>(
-        filter_dag, context, column_names, expression,
-        /* single_point_ */ false, /* skip_analysis_ */ false, /* require_ready_sets_ */ true);
-
-    /// A statistic's min/max is aggregated the same way `getExtremes` is, so it skips NaN.
-    /// Must run before `alwaysUnknownOrTrue()`, whose verdict this can change.
-    new_key_condition->relaxAtomsOverNaNHidingColumns(columns.getTypes());
-
-    if (new_key_condition->alwaysUnknownOrTrue())
+    auto [it, inserted] = key_condition_cache.try_emplace(column_names);
+    if (inserted)
     {
-        key_condition_cache[column_names] = nullptr;
-        return nullptr;
+        ActionsDAG actions_dag(columns);
+        auto expression = std::make_shared<ExpressionActions>(std::move(actions_dag));
+
+        /// Pruning estimates must not run a query pipeline: only state that is already computed may be
+        /// read here.
+        auto new_key_condition = std::make_unique<KeyCondition>(
+            filter_dag, context, column_names, expression,
+            /* single_point_ */ false, /* skip_analysis_ */ false, /* require_ready_sets_ */ true);
+
+        /// A statistic's min/max is aggregated the same way `getExtremes` is, so it skips NaN.
+        /// Must run before `alwaysUnknownOrTrue()`, whose verdict this can change.
+        new_key_condition->relaxAtomsOverNaNHidingColumns(columns.getTypes());
+
+        if (!new_key_condition->alwaysUnknownOrTrue())
+            it->second.condition = std::move(new_key_condition);
     }
 
-    auto & cached_key_condition = key_condition_cache[column_names];
-    cached_key_condition = std::move(new_key_condition);
-    auto * key_condition_ptr = cached_key_condition.get();
-
-    if (record_used_columns)
+    auto * key_condition_ptr = it->second.condition.get();
+    if (key_condition_ptr && record_used_columns && !it->second.used_columns_recorded)
     {
         for (size_t col_idx : key_condition_ptr->getUsedColumns())
         {
             if (col_idx < column_names.size())
-                used_column_names.insert(column_names[col_idx]);
+                used_column_names.insert(resolveParentColumn(column_names[col_idx]));
         }
+        it->second.used_columns_recorded = true;
     }
 
     return key_condition_ptr;
@@ -381,28 +326,10 @@ KeyCondition * StatisticsPartPruner::getKeyConditionForEstimates(const NamesAndT
 
 BoolMask StatisticsPartPruner::checkPartCanMatch(const Estimates & estimates)
 {
-    for (const auto & [column, is_null] : null_predicates)
-    {
-        auto est_it = estimates.find(column);
-        if (est_it == estimates.end())
-            continue;
-
-        const Estimate & estimate = est_it->second;
-        if (!estimate.estimated_null_count.has_value() || estimate.rows_count == 0
-            || *estimate.estimated_null_count > estimate.rows_count)
-            continue;
-
-        if (is_null && *estimate.estimated_null_count == 0)
-            return {false, true};
-        if (!is_null && *estimate.estimated_null_count == estimate.rows_count)
-            return {false, true};
-    }
-
-    /// Use only columns that are both in filter and have estimates
     NamesAndTypesList columns;
     for (const auto & [col_name, col_type] : stats_column_name_to_type_map)
     {
-        if (estimates.contains(col_name))
+        if (estimates.contains(resolveParentColumn(col_name)))
             columns.emplace_back(col_name, col_type);
     }
 
@@ -415,14 +342,22 @@ BoolMask StatisticsPartPruner::checkPartCanMatch(const Estimates & estimates)
 
     Hyperrectangle hyperrectangle;
     DataTypes types;
+    hyperrectangle.reserve(columns.size());
+    types.reserve(columns.size());
 
     for (const auto & [col_name, col_type] : columns)
     {
-        auto range = createRangeFromEstimate(estimates.at(col_name), isNullableOrLowCardinalityNullable(col_type));
+        const auto parent_it = null_subcolumn_to_parent.find(col_name);
+        const bool is_null_subcolumn = parent_it != null_subcolumn_to_parent.end();
+        const Estimate & estimate = estimates.at(is_null_subcolumn ? parent_it->second : col_name);
+
+        auto range = is_null_subcolumn
+            ? createNullSubcolumnRangeFromEstimate(estimate)
+            : createRangeFromEstimate(estimate, canContainNull(*col_type));
 
         if (range.has_value())
             hyperrectangle.push_back(std::move(*range));
-        else if (isNullableOrLowCardinalityNullable(col_type))
+        else if (canContainNull(*col_type))
             hyperrectangle.emplace_back(Range::createWholeUniverse());
         else
             hyperrectangle.emplace_back(Range::createWholeUniverseWithoutNull());
