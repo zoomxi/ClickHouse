@@ -1244,6 +1244,7 @@ RuntimeFilter::RuntimeFilter(RuntimeFilterConfig config_, Data data_)
     : filter_column_target_type(std::visit([](const auto & filter) { return filter.getTargetType(); }, data_.filter))
     , evaluation_state(std::move(config_))
     , data(std::move(data_))
+    , ready(data.build_state.isFinished())
 {
 }
 
@@ -1267,24 +1268,40 @@ void RuntimeFilter::insert(ColumnPtr values)
 void RuntimeFilter::finishInsert()
 {
     std::lock_guard lock(mutex);
-    if (data.build_state.hasPendingMerges())
+    /// `add` no longer serializes finish with the lookup mutex, so two callers can both observe a
+    /// zero merge count. The first one publishes; the second must not run the inner finish again.
+    if (data.build_state.hasPendingMerges() || data.build_state.isFinished())
         return;
 
     std::visit([&](auto & filter) { filter.finishInsert(evaluation_state); }, data.filter);
     data.build_state.finishInserts();
+    ready.store(true, std::memory_order_release);
 }
 
 ColumnPtr RuntimeFilter::find(const ColumnWithTypeAndName & values) const
 {
-    SharedLockGuard lock(mutex);
-    data.build_state.assertCanFind();
+    /// Publication can land between the acquire and this lock. `assertCanFind` then passes, and the
+    /// probe still has to run under the lock already held.
+    if (!ready.load(std::memory_order_acquire))
+    {
+        SharedLockGuard lock(mutex);
+        data.build_state.assertCanFind();
+        return findPublished(values);
+    }
+    return findPublished(values);
+}
+
+ColumnPtr RuntimeFilter::findPublished(const ColumnWithTypeAndName & values) const
+{
+    /// Caller either observed `ready` with acquire, or holds `mutex`.
+    const auto & published = TSA_SUPPRESS_WARNING_FOR_READ(data);
 
     const size_t rows_in_block = values.column->size();
     if (evaluation_state.shouldSkip(rows_in_block))
         return DataTypeUInt8().createColumnConst(rows_in_block, true);
 
     std::optional<size_t> rows_passed;
-    auto result = std::visit([&](const auto & filter) -> ColumnPtr { return filter.find(values, rows_passed); }, data.filter);
+    auto result = std::visit([&](const auto & filter) -> ColumnPtr { return filter.find(values, rows_passed); }, published.filter);
     evaluation_state.updateStats(rows_in_block, rows_passed ? *rows_passed : countPassedStats(result));
     return result;
 }
@@ -1385,36 +1402,67 @@ class RuntimeFilterLookup : public IRuntimeFilterLookup
 public:
     void add(const String & key, const String & display_name, UniqueRuntimeFilterPtr runtime_filter) override
     {
-        std::lock_guard lock(mutex);
-        auto & filter = filters_by_name[key];
-        if (!filter)
+        SharedRuntimeFilterPtr published;
+        bool created = false;
         {
-            ProfileEvents::increment(ProfileEvents::RuntimeFiltersCreated);
-            filter.reset(runtime_filter.release()); /// Save new filter.
-            /// Record the readable structural name once because the map is keyed by the opaque rendezvous key.
-            display_names.emplace(key, display_name);
+            std::lock_guard lock(mutex);
+            auto & slot = filters_by_name[key];
+            if (!slot)
+            {
+                ProfileEvents::increment(ProfileEvents::RuntimeFiltersCreated);
+                slot.reset(runtime_filter.release()); /// Save new filter.
+                /// Record the readable structural name once because the map is keyed by the opaque rendezvous key.
+                display_names.emplace(key, display_name);
+                created = true;
+            }
+            published = slot;
+        }
+
+        if (created)
+        {
             LOG_TRACE(getLogger("RuntimeFilter"), "Registered runtime filter '{}' under key '{}'", display_name, key);
         }
         else
         {
-            filter->merge(*runtime_filter); /// Add all new keys to an existing filter.
             LOG_TRACE(getLogger("RuntimeFilter"), "Merged a partial into runtime filter '{}' under key '{}'", display_name, key);
+            published->merge(*runtime_filter);
         }
+
         /// The registration above already makes the filter findable by the probe side, so skipping
         /// the call below holds it in the registered-but-unfinished state that is otherwise transient.
         fiu_do_on(FailPoints::runtime_filter_skip_finish_insert, { return; });
-        filter->finishInsert();
+        published->finishInsert();
     }
 
     void replace(const String & name, UniqueRuntimeFilterPtr runtime_filter) override
     {
-        std::lock_guard lock(mutex);
-        auto & filter = filters_by_name[name];
-        if (!filter)
-            ProfileEvents::increment(ProfileEvents::RuntimeFiltersCreated);
-        else
-            runtime_filter->supersede(*filter);
-        filter.reset(runtime_filter.release());
+        /// `supersede` locks the replaced filter via `describe`. Keep that off the lookup mutex, and
+        /// retry if the slot changed before publication so the stats stay attached to the object replaced.
+        for (;;)
+        {
+            SharedRuntimeFilterPtr previous;
+            {
+                std::lock_guard lock(mutex);
+                auto it = filters_by_name.find(name);
+                if (it != filters_by_name.end())
+                    previous = it->second;
+            }
+
+            if (previous)
+                runtime_filter->supersede(*previous);
+
+            {
+                std::lock_guard lock(mutex);
+                auto & slot = filters_by_name[name];
+                if (slot != previous)
+                    continue;
+
+                if (!slot)
+                    ProfileEvents::increment(ProfileEvents::RuntimeFiltersCreated);
+                slot.reset(runtime_filter.release());
+                return;
+            }
+        }
     }
 
     RuntimeFilterConstPtr find(const String & name) const override

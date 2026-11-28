@@ -18,9 +18,16 @@
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <atomic>
+#include <barrier>
+#include <chrono>
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -803,3 +810,436 @@ BENCHMARK(BM_RuntimeFilterAdaptiveBuildTransformInsertOnlyUInt64)
 BENCHMARK(BM_RuntimeFilterAdaptiveBuildTransformInsertOnlyCastUInt32ToUInt64)
     ->Args({/*rows=*/10000, /*chunk_rows=*/8192})
     ->Args({/*rows=*/100000, /*chunk_rows=*/8192});
+
+constexpr UInt64 LOOKUP_CONTENTION_BLOOM_BYTES = 8 * 1024 * 1024;
+constexpr size_t LOOKUP_CONTENTION_PARTIALS = 8;
+constexpr size_t LOOKUP_CONTENTION_PROBE_THREADS = 16;
+
+static RuntimeFilterGeometry makeLargeBloomGeometry()
+{
+    return RuntimeFilterGeometry{
+        .exact_values_limit = 1,
+        .exact_bytes_limit = LOOKUP_CONTENTION_BLOOM_BYTES,
+        .bloom_filter_bytes = LOOKUP_CONTENTION_BLOOM_BYTES,
+        .bloom_filter_hash_functions = BLOOM_FILTER_HASH_FUNCTIONS,
+        .pass_ratio_threshold_for_disabling = DISABLE_ADAPTIVE_SKIP_THRESHOLD,
+        .blocks_to_skip_before_reenabling = BLOCKS_TO_SKIP_BEFORE_REENABLING,
+        .max_ratio_of_set_bits_in_bloom_filter = DISABLE_BLOOM_FULLNESS_CHECK,
+    };
+}
+
+static RuntimeFilterConfig makeContentionConfig()
+{
+    return RuntimeFilterConfig{DISABLE_ADAPTIVE_SKIP_THRESHOLD, BLOCKS_TO_SKIP_BEFORE_REENABLING};
+}
+
+static ColumnPtr makeSingleUInt64(UInt64 value)
+{
+    auto column = ColumnUInt64::create();
+    column->insertValue(value);
+    return column;
+}
+
+static void requireMask(const ColumnPtr & mask, std::initializer_list<UInt8> expected)
+{
+    if (mask->size() != expected.size())
+        throw std::runtime_error("runtime filter mask size mismatch");
+
+    size_t row = 0;
+    for (const auto expected_value : expected)
+    {
+        if (mask->getBool(row) != (expected_value != 0))
+            throw std::runtime_error("runtime filter mask mismatch at row " + std::to_string(row));
+        ++row;
+    }
+}
+
+/// Two inserts: the second distinct key overflows the exact limit and switches the filter to the bloom.
+static UniqueRuntimeFilterPtr makeLargeBloomPartial(const DataTypePtr & type, size_t filters_to_merge)
+{
+    auto filter = std::make_unique<RuntimeFilter>(
+        filters_to_merge,
+        makeContentionConfig(),
+        RuntimeFilter::Adaptive(type, makeLargeBloomGeometry(), std::nullopt, false));
+    filter->insert(makeSingleUInt64(1));
+    filter->insert(makeSingleUInt64(2));
+    return filter;
+}
+
+static void requireLargeBloomIsBuilt(const DataTypePtr & type)
+{
+    auto sample = makeLargeBloomPartial(type, /*filters_to_merge=*/0);
+    sample->finishInsert();
+    const auto description = sample->describe();
+    if (description.kind != RuntimeFilterKind::BloomFilter || !description.bytes || *description.bytes < LOOKUP_CONTENTION_BLOOM_BYTES)
+        throw std::runtime_error("lookup contention benchmark did not build an 8MiB bloom");
+}
+
+/// `__applyFilter` while another key is merging a large bloom.
+/// Probe count during the merge is the signal: the lookup mutex used to be held for the whole OR.
+static void BM_ApplyFilterDuringOtherBloomMerge(benchmark::State & state)
+{
+    ensureFunctionsRegistered();
+    const auto type = uint64Type();
+    requireLargeBloomIsBuilt(type);
+    const auto probe_argument = makeArgument(makeSingleUInt64(1), type);
+
+    uint64_t probes = 0;
+    for (auto _ [[maybe_unused]] : state)
+    {
+        std::vector<UniqueRuntimeFilterPtr> partials;
+        partials.reserve(LOOKUP_CONTENTION_PARTIALS);
+        for (size_t index = 0; index < LOOKUP_CONTENTION_PARTIALS; ++index)
+            partials.push_back(makeLargeBloomPartial(type, index == 0 ? LOOKUP_CONTENTION_PARTIALS - 1 : 0));
+
+        auto lookup = createRuntimeFilterLookup();
+        auto probe = std::make_unique<RuntimeFilter>(
+            /*filters_to_merge_=*/0,
+            makeContentionConfig(),
+            RuntimeFilter::ExactContains(type, EXACT_VALUES_BYTES_LIMIT, EXACT_VALUES_LIMIT_FOR_EXACT_FILTER));
+        probe->insert(makeSingleUInt64(1));
+        lookup->add("probe", "probe", std::move(probe));
+
+        std::atomic<bool> measure{false};
+        std::atomic<bool> stop{false};
+        std::atomic<uint64_t> local_probes{0};
+        std::barrier<> start(LOOKUP_CONTENTION_PROBE_THREADS + 1);
+        std::vector<std::thread> threads;
+        threads.reserve(LOOKUP_CONTENTION_PROBE_THREADS);
+        for (size_t thread_index = 0; thread_index < LOOKUP_CONTENTION_PROBE_THREADS; ++thread_index)
+        {
+            threads.emplace_back(
+                [&]
+                {
+                    start.arrive_and_wait();
+                    uint64_t seen = 0;
+                    while (!stop.load(std::memory_order_relaxed))
+                    {
+                        auto filter = lookup->find("probe");
+                        if (!filter || !filter->isReady())
+                            continue;
+                        auto result = filter->find(probe_argument);
+                        if (measure.load(std::memory_order_relaxed))
+                            seen += result->getUInt(0);
+                    }
+                    local_probes.fetch_add(seen, std::memory_order_relaxed);
+                });
+        }
+
+        start.arrive_and_wait();
+        const auto started_at = std::chrono::steady_clock::now();
+        measure.store(true, std::memory_order_relaxed);
+        for (auto & partial : partials)
+            lookup->add("bloom", "bloom", std::move(partial));
+        const auto elapsed = std::chrono::steady_clock::now() - started_at;
+        measure.store(false, std::memory_order_relaxed);
+        stop.store(true, std::memory_order_relaxed);
+
+        state.SetIterationTime(std::chrono::duration<double>(elapsed).count());
+        for (auto & thread : threads)
+            thread.join();
+        probes += local_probes.load(std::memory_order_relaxed);
+    }
+
+    state.counters["probes_during_merge"] = benchmark::Counter(static_cast<double>(probes), benchmark::Counter::kAvgIterations);
+    state.SetItemsProcessed(static_cast<int64_t>(probes));
+}
+
+/// Many threads call `isReady` and `find` on one finished filter, with no concurrent writer.
+static void BM_ReadyFilterFindContended(benchmark::State & state)
+{
+    ensureFunctionsRegistered();
+    const auto rows = static_cast<size_t>(state.range(0));
+    const auto thread_count = static_cast<size_t>(state.range(1));
+    const auto iters = thread_count == 1 ? size_t{100000} : size_t{20000};
+    const auto type = uint64Type();
+
+    auto filter = std::make_unique<RuntimeFilter>(
+        /*filters_to_merge_=*/0,
+        makeContentionConfig(),
+        RuntimeFilter::ExactContains(type, EXACT_VALUES_BYTES_LIMIT, EXACT_VALUES_LIMIT_FOR_EXACT_FILTER));
+    filter->insert(makeSingleUInt64(0));
+    filter->finishInsert();
+    const auto argument = makeArgument(makeUInt64Column(rows, /*key_count=*/1, HitRatio::All, ValuePattern::Sequential), type);
+
+    std::atomic<uint64_t> ticket{0};
+    std::atomic<uint64_t> finished{0};
+    std::vector<std::thread> threads;
+    threads.reserve(thread_count);
+    for (size_t thread_index = 0; thread_index < thread_count; ++thread_index)
+    {
+        threads.emplace_back(
+            [&]
+            {
+                uint64_t seen = 0;
+                for (;;)
+                {
+                    const auto current = ticket.load(std::memory_order_acquire);
+                    if (current == std::numeric_limits<uint64_t>::max())
+                        return;
+                    if (current == seen)
+                        continue;
+
+                    uint64_t sink = 0;
+                    for (size_t iteration = 0; iteration < iters; ++iteration)
+                    {
+                        sink += static_cast<uint64_t>(filter->isReady());
+                        auto result = filter->find(argument);
+                        sink += result->getUInt(0);
+                    }
+                    benchmark::DoNotOptimize(sink);
+                    finished.fetch_add(1, std::memory_order_release);
+                    seen = current;
+                }
+            });
+    }
+
+    uint64_t round = 0;
+    for (auto _ [[maybe_unused]] : state)
+    {
+        finished.store(0, std::memory_order_relaxed);
+        const auto started_at = std::chrono::steady_clock::now();
+        ticket.store(++round, std::memory_order_release);
+        while (finished.load(std::memory_order_acquire) < thread_count)
+            ;
+        state.SetIterationTime(std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at).count());
+    }
+
+    ticket.store(std::numeric_limits<uint64_t>::max(), std::memory_order_release);
+    for (auto & thread : threads)
+        thread.join();
+
+    recordRows(state, thread_count * iters * rows);
+}
+
+
+/// `isReady` only. `find` also updates profile counters, which hide the mutex cost.
+/// Same shape as `Threading.PerfTestSharedMutex*`: fixed calls per thread, thread sweep.
+[[gnu::noinline]] static bool callIsReady(const RuntimeFilter & filter)
+{
+    const bool ready = filter.isReady();
+    benchmark::DoNotOptimize(ready);
+    return ready;
+}
+
+static void BM_ReadyIsReadyContended(benchmark::State & state)
+{
+    ensureFunctionsRegistered();
+    const auto thread_count = static_cast<size_t>(state.range(0));
+    constexpr size_t iters = 2'000'000;
+    const auto type = uint64Type();
+
+    auto filter = std::make_unique<RuntimeFilter>(
+        /*filters_to_merge_=*/0,
+        makeContentionConfig(),
+        RuntimeFilter::ExactContains(type, EXACT_VALUES_BYTES_LIMIT, EXACT_VALUES_LIMIT_FOR_EXACT_FILTER));
+    filter->insert(makeSingleUInt64(0));
+    filter->finishInsert();
+
+    std::atomic<uint64_t> ticket{0};
+    std::atomic<uint64_t> finished{0};
+    std::vector<std::thread> threads;
+    threads.reserve(thread_count);
+    for (size_t thread_index = 0; thread_index < thread_count; ++thread_index)
+    {
+        threads.emplace_back(
+            [&]
+            {
+                uint64_t seen = 0;
+                for (;;)
+                {
+                    const auto current = ticket.load(std::memory_order_acquire);
+                    if (current == std::numeric_limits<uint64_t>::max())
+                        return;
+                    if (current == seen)
+                        continue;
+
+                    uint64_t sink = 0;
+                    for (size_t iteration = 0; iteration < iters; ++iteration)
+                        sink += static_cast<uint64_t>(callIsReady(*filter));
+                    benchmark::DoNotOptimize(sink);
+                    finished.fetch_add(1, std::memory_order_release);
+                    seen = current;
+                }
+            });
+    }
+
+    uint64_t round = 0;
+    for (auto _ [[maybe_unused]] : state)
+    {
+        finished.store(0, std::memory_order_relaxed);
+        const auto started_at = std::chrono::steady_clock::now();
+        ticket.store(++round, std::memory_order_release);
+        while (finished.load(std::memory_order_acquire) < thread_count)
+            ;
+        state.SetIterationTime(std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at).count());
+    }
+
+    ticket.store(std::numeric_limits<uint64_t>::max(), std::memory_order_release);
+    for (auto & thread : threads)
+        thread.join();
+
+    recordRows(state, thread_count * iters);
+}
+
+
+static void BM_RuntimeFilterLookupLockChecks(benchmark::State & state)
+{
+    ensureFunctionsRegistered();
+    const auto type = uint64Type();
+    for (auto _ [[maybe_unused]] : state)
+    {
+        {
+            RuntimeFilter exact(
+                /*filters_to_merge_=*/0,
+                makeContentionConfig(),
+                RuntimeFilter::ExactContains(type, EXACT_VALUES_BYTES_LIMIT, EXACT_VALUES_LIMIT_FOR_EXACT_FILTER));
+            exact.insert(makeSingleUInt64(7));
+            exact.finishInsert();
+            exact.finishInsert();
+            requireMask(exact.find(makeArgument(makeUInt64Column(2, /*key_count=*/0, HitRatio::Zero, ValuePattern::Sequential), type)), {0, 0});
+            /// key_count 0 makes absent keys 1 and 2. Probe the inserted key directly.
+            auto present = ColumnUInt64::create();
+            present->insertValue(7);
+            present->insertValue(8);
+            requireMask(exact.find(makeArgument(std::move(present), type)), {1, 0});
+        }
+
+        {
+            auto lookup = createRuntimeFilterLookup();
+            /// Every partial carries the full merge count. Whichever object wins registration is the one that is merged into.
+            constexpr size_t partials = 8;
+            std::barrier<> start(partials);
+            std::atomic<bool> failed{false};
+            std::vector<std::thread> threads;
+            threads.reserve(partials);
+            for (size_t index = 0; index < partials; ++index)
+            {
+                threads.emplace_back(
+                    [&, index]
+                    {
+                        try
+                        {
+                            auto partial = std::make_unique<RuntimeFilter>(
+                                /*filters_to_merge_=*/partials - 1,
+                                makeContentionConfig(),
+                                RuntimeFilter::ExactContains(type, EXACT_VALUES_BYTES_LIMIT, EXACT_VALUES_LIMIT_FOR_EXACT_FILTER));
+                            partial->insert(makeSingleUInt64(index));
+                            start.arrive_and_wait();
+                            lookup->add("union", "union", std::move(partial));
+                        }
+                        catch (...)
+                        {
+                            failed.store(true);
+                        }
+                    });
+            }
+            for (auto & thread : threads)
+                thread.join();
+            if (failed.load())
+                throw std::runtime_error("concurrent add threw");
+
+            auto merged = lookup->find("union");
+            if (!merged || !merged->isReady())
+                throw std::runtime_error("concurrent add did not publish");
+            auto keys = ColumnUInt64::create();
+            for (UInt64 key = 0; key < partials; ++key)
+                keys->insertValue(key);
+            keys->insertValue(100);
+            requireMask(merged->find(makeArgument(std::move(keys), type)), {1, 1, 1, 1, 1, 1, 1, 1, 0});
+        }
+
+        {
+            auto lookup = createRuntimeFilterLookup();
+            auto initial = std::make_unique<RuntimeFilter>(
+                /*filters_to_merge_=*/1,
+                makeContentionConfig(),
+                RuntimeFilter::ExactContains(type, EXACT_VALUES_BYTES_LIMIT, EXACT_VALUES_LIMIT_FOR_EXACT_FILTER));
+            initial->insert(makeSingleUInt64(3));
+            lookup->add("runtime_filter", "runtime_filter", std::move(initial));
+
+            auto shared = std::make_unique<RuntimeFilter>(
+                /*filters_to_merge_=*/0,
+                makeContentionConfig(),
+                RuntimeFilter::SharedFixedHashTable(
+                    type,
+                    [](const ColumnWithTypeAndName & values)
+                    {
+                        auto result = ColumnUInt8::create();
+                        auto & result_data = result->getData();
+                        result_data.resize(values.column->size());
+                        for (size_t row = 0; row < values.column->size(); ++row)
+                        {
+                            const auto value = values.column->getUInt(row);
+                            result_data[row] = value == 1 || value == 3 || value == 7;
+                        }
+                        return result;
+                    }));
+            auto late = std::make_unique<RuntimeFilter>(
+                /*filters_to_merge_=*/0,
+                makeContentionConfig(),
+                RuntimeFilter::ExactContains(type, EXACT_VALUES_BYTES_LIMIT, EXACT_VALUES_LIMIT_FOR_EXACT_FILTER));
+            late->insert(makeSingleUInt64(1));
+
+            std::barrier<> start(2);
+            std::atomic<bool> failed{false};
+            std::thread publisher(
+                [&]
+                {
+                    start.arrive_and_wait();
+                    try
+                    {
+                        lookup->replace("runtime_filter", std::move(shared));
+                    }
+                    catch (...)
+                    {
+                        failed.store(true);
+                    }
+                });
+            std::thread late_add(
+                [&]
+                {
+                    start.arrive_and_wait();
+                    try
+                    {
+                        lookup->add("runtime_filter", "runtime_filter", std::move(late));
+                    }
+                    catch (...)
+                    {
+                        failed.store(true);
+                    }
+                });
+            publisher.join();
+            late_add.join();
+            if (failed.load())
+                throw std::runtime_error("replace raced with late add and threw");
+
+            auto filter = lookup->find("runtime_filter");
+            if (!filter || !filter->isReady() || filter->describe().kind != RuntimeFilterKind::SharedFixedHashMap)
+                throw std::runtime_error("replace lost the race to the late add");
+            requireMask(filter->find(makeArgument(makeSingleUInt64(1), type)), {1});
+        }
+    }
+}
+
+BENCHMARK(BM_ApplyFilterDuringOtherBloomMerge)->UseManualTime()->Unit(benchmark::kMillisecond)->MinTime(0.5);
+
+BENCHMARK(BM_ReadyFilterFindContended)
+    ->Args({/*rows=*/1, /*threads=*/1})
+    ->Args({/*rows=*/1, /*threads=*/16})
+    ->Args({/*rows=*/128, /*threads=*/16})
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond)
+    ->MinTime(0.5);
+
+BENCHMARK(BM_ReadyIsReadyContended)
+    ->Arg(1)
+    ->Arg(2)
+    ->Arg(4)
+    ->Arg(8)
+    ->Arg(16)
+    ->UseManualTime()
+    ->Unit(benchmark::kMicrosecond)
+    ->MinTime(0.3);
+
+BENCHMARK(BM_RuntimeFilterLookupLockChecks)->Iterations(1);

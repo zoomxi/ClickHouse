@@ -18,12 +18,14 @@
 #include <Common/tests/gtest_global_register.h>
 
 #include <array>
+#include <atomic>
 #include <barrier>
 #include <initializer_list>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <thread>
+#include <vector>
 
 namespace ProfileEvents
 {
@@ -986,6 +988,146 @@ TEST(RuntimeFilterLookup, ReplacementKeepsStatsAndNamesTheReplacedFilter)
     EXPECT_EQ(filter->getStats().blocks_processed.load(), 2);
     EXPECT_EQ(filter->getStats().rows_checked.load(), 5);
     EXPECT_EQ(filter->getStats().rows_passed.load(), 2);
+}
+
+TEST(RuntimeFilterLookup, FinishInsertIsIdempotent)
+{
+    const auto type = makeUInt64Type();
+
+    RuntimeFilter exact(
+        /*filters_to_merge_=*/0,
+        makeRuntimeFilterConfig(),
+        RuntimeFilter::ExactContains(type, /*bytes_limit_=*/1_MiB, /*exact_values_limit_=*/100));
+    exact.insert(makeUInt64Column({7}));
+    exact.finishInsert();
+    exact.finishInsert();
+    expectMask(exact.find(makeUInt64ColumnWithType({7, 8}, type)), {1, 0});
+
+    RuntimeFilter adaptive(
+        /*filters_to_merge_=*/0,
+        makeRuntimeFilterConfig(),
+        RuntimeFilter::Adaptive(type, makeGeometry(1_MiB, /*exact_values_limit=*/100, 3, 1.0), std::nullopt, false));
+    adaptive.insert(makeUInt64Column({1, 3, 5}));
+    adaptive.finishInsert();
+    adaptive.finishInsert();
+    expectMask(adaptive.find(makeUInt64ColumnWithType({1, 2, 5}, type)), {1, 0, 1});
+}
+
+TEST(RuntimeFilterLookup, ConcurrentAddsPublishTheUnion)
+{
+    const auto type = makeUInt64Type();
+    auto lookup = createRuntimeFilterLookup();
+
+    /// Every partial carries the full merge count. The first object to win the lookup slot is the
+    /// destination, so a partial constructed with zero pending merges would publish before the union.
+    constexpr size_t partials = 8;
+    std::barrier<> start(partials);
+    std::atomic<bool> failed{false};
+    std::vector<std::thread> threads;
+    threads.reserve(partials);
+    for (size_t index = 0; index < partials; ++index)
+    {
+        threads.emplace_back(
+            [&, index]
+            {
+                try
+                {
+                    auto partial = std::make_unique<RuntimeFilter>(
+                        /*filters_to_merge_=*/partials - 1,
+                        makeRuntimeFilterConfig(),
+                        RuntimeFilter::ExactContains(type, /*bytes_limit_=*/1_MiB, /*exact_values_limit_=*/100));
+                    partial->insert(makeUInt64Column({index}));
+                    start.arrive_and_wait();
+                    lookup->add("runtime_filter", "runtime_filter", std::move(partial));
+                }
+                catch (...)
+                {
+                    failed.store(true);
+                }
+            });
+    }
+    for (auto & thread : threads)
+        thread.join();
+
+    ASSERT_FALSE(failed.load());
+    auto merged = lookup->find("runtime_filter");
+    ASSERT_TRUE(merged);
+    EXPECT_TRUE(merged->isReady());
+    expectMask(merged->find(makeUInt64ColumnWithType({0, 1, 2, 3, 4, 5, 6, 7, 100}, type)), {1, 1, 1, 1, 1, 1, 1, 1, 0});
+}
+
+TEST(RuntimeFilterLookup, ReplaceRacesLateAdd)
+{
+    const auto type = makeUInt64Type();
+    auto lookup = createRuntimeFilterLookup();
+
+    auto initial = std::make_unique<RuntimeFilter>(
+        /*filters_to_merge_=*/1,
+        makeRuntimeFilterConfig(),
+        RuntimeFilter::ExactContains(type, /*bytes_limit_=*/1_MiB, /*exact_values_limit_=*/100));
+    initial->insert(makeUInt64Column({3}));
+    lookup->add("runtime_filter", "runtime_filter", std::move(initial));
+
+    auto shared = std::make_unique<RuntimeFilter>(
+        /*filters_to_merge_=*/0,
+        makeRuntimeFilterConfig(),
+        RuntimeFilter::SharedFixedHashTable(
+            type,
+            [](const ColumnWithTypeAndName & values)
+            {
+                auto result = ColumnUInt8::create();
+                auto & result_data = result->getData();
+                result_data.resize(values.column->size());
+                for (size_t row = 0; row < values.column->size(); ++row)
+                {
+                    const auto value = values.column->getUInt(row);
+                    result_data[row] = value == 1 || value == 3 || value == 7;
+                }
+                return result;
+            }));
+    auto late = std::make_unique<RuntimeFilter>(
+        /*filters_to_merge_=*/0,
+        makeRuntimeFilterConfig(),
+        RuntimeFilter::ExactContains(type, /*bytes_limit_=*/1_MiB, /*exact_values_limit_=*/100));
+    late->insert(makeUInt64Column({1}));
+
+    std::barrier<> start(2);
+    std::atomic<bool> failed{false};
+    std::thread publisher(
+        [&]
+        {
+            start.arrive_and_wait();
+            try
+            {
+                lookup->replace("runtime_filter", std::move(shared));
+            }
+            catch (...)
+            {
+                failed.store(true);
+            }
+        });
+    std::thread late_add(
+        [&]
+        {
+            start.arrive_and_wait();
+            try
+            {
+                lookup->add("runtime_filter", "runtime_filter", std::move(late));
+            }
+            catch (...)
+            {
+                failed.store(true);
+            }
+        });
+    publisher.join();
+    late_add.join();
+
+    ASSERT_FALSE(failed.load());
+    auto filter = lookup->find("runtime_filter");
+    ASSERT_TRUE(filter);
+    EXPECT_TRUE(filter->isReady());
+    EXPECT_EQ(filter->describe().kind, RuntimeFilterKind::SharedFixedHashMap);
+    expectMask(filter->find(makeUInt64ColumnWithType({1, 3, 7, 9}, type)), {1, 1, 1, 0});
 }
 
 }

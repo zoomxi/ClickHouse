@@ -494,11 +494,8 @@ public:
     ColumnPtr find(const ColumnWithTypeAndName & values) const;
 
     /// Whether building and all expected merges have finished.
-    bool isReady() const
-    {
-        SharedLockGuard lock(mutex);
-        return data.build_state.isFinished();
-    }
+    /// After this is true the filter is immutable and `find` does not take `mutex`.
+    bool isReady() const { return ready.load(std::memory_order_acquire); }
 
     /// Add all keys from one filter to the other so that destination filter contains the union of both filters.
     /// The source must be a distinct filter. Both filters are locked in stable address order.
@@ -530,6 +527,12 @@ private:
     std::optional<RuntimeFilterKind> replaced_kind;
     mutable SharedMutex mutex;
     Data data TSA_GUARDED_BY(mutex);
+
+    /// Published with release after the filter becomes immutable. A prebuilt filter starts finished,
+    /// so this starts true. Monotonic: never stored back to false.
+    std::atomic<bool> ready{false};
+
+    ColumnPtr findPublished(const ColumnWithTypeAndName & values) const;
 };
 
 /// Store and find per-query runtime filters that are used for optimizing some kinds of JOINs
